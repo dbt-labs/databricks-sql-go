@@ -25,33 +25,40 @@ import (
 )
 
 const (
-	azureClientId    = "96eecda7-19ea-49cc-abb5-240097d554f5"
-	azureRedirectURL = "localhost:8030"
+	azureClientId = "96eecda7-19ea-49cc-abb5-240097d554f5"
 
-	awsClientId    = "databricks-sql-connector"
-	awsRedirectURL = "localhost:8030"
+	awsClientId = "databricks-sql-connector"
 
-	gcpClientId    = "databricks-sql-connector"
-	gcpRedirectURL = "localhost:8030"
+	gcpClientId = "databricks-sql-connector"
+
+	defaultPort = 8030
 )
 
-func NewAuthenticator(hostName string, timeout time.Duration) (auth.Authenticator, error) {
+// NewAuthenticator creates a new U2M OAuth authenticator.
+// The port parameter specifies the local port for the OAuth redirect callback.
+// If port is 0, the default port (8030) will be used.
+// Example DSN usage: "https://host?authType=databricks-oauth&oauthRedirectPort=9000"
+func NewAuthenticator(hostName string, timeout time.Duration, port int) (auth.Authenticator, error) {
 
 	cloud := oauth.InferCloudFromHost(hostName)
 
-	var clientID, redirectURL string
+	var clientID string
 	if cloud == oauth.AWS {
 		clientID = awsClientId
-		redirectURL = awsRedirectURL
 	} else if cloud == oauth.Azure {
 		clientID = azureClientId
-		redirectURL = azureRedirectURL
 	} else if cloud == oauth.GCP {
 		clientID = gcpClientId
-		redirectURL = gcpRedirectURL
 	} else {
 		return nil, errors.New("unhandled cloud type: " + cloud.String())
 	}
+
+	// Use default port if not specified
+	if port == 0 {
+		port = defaultPort
+	}
+
+	redirectURL := fmt.Sprintf("localhost:%d", port)
 
 	// Get an oauth2 config
 	config, err := GetConfig(context.Background(), hostName, clientID, "", redirectURL, nil)
