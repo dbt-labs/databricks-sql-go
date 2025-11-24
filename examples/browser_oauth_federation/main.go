@@ -40,7 +40,7 @@ func main() {
 	fmt.Printf("Path: %s\n\n", httpPath)
 
 	// Create U2M authenticator - this will open a browser for login
-	authenticator, err := u2m.NewAuthenticator(host, 2*time.Minute)
+	authenticator, err := u2m.NewAuthenticator(host, 2*time.Minute, 0)
 	if err != nil {
 		log.Fatalf("Failed to create authenticator: %v", err)
 	}

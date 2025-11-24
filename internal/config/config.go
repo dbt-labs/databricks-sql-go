@@ -124,6 +124,8 @@ type UserConfig struct {
 	// promoted selector Config.UseArrowNativeDecimal stays unambiguous.
 	// See databricks/databricks-sql-go#274.
 	UseArrowNativeDecimalDSN bool
+	// Port for OAuth U2M redirect callback (default: 8030)
+	OAuthRedirectPort        int
 	CloudFetchConfig
 }
 
@@ -167,6 +169,7 @@ func (ucfg UserConfig) DeepCopy() UserConfig {
 		UseLz4Compression:        ucfg.UseLz4Compression,
 		EnableMetricViewMetadata: ucfg.EnableMetricViewMetadata,
 		UseArrowNativeDecimalDSN: ucfg.UseArrowNativeDecimalDSN,
+		OAuthRedirectPort:        ucfg.OAuthRedirectPort,
 		CloudFetchConfig:         ucfg.CloudFetchConfig,
 		EnableTelemetry:          ucfg.EnableTelemetry,
 		TelemetryBatchSize:       ucfg.TelemetryBatchSize,
@@ -287,6 +290,13 @@ func ParseDSN(dsn string) (UserConfig, error) {
 	}
 	if schema, ok := params.extract("schema"); ok {
 		ucfg.Schema = schema
+	}
+
+	if oauthRedirectPort, ok, err := params.extractAsInt("oauthRedirectPort"); ok {
+		if err != nil {
+			return UserConfig{}, err
+		}
+		ucfg.OAuthRedirectPort = oauthRedirectPort
 	}
 
 	// Cloud Fetch parameters
@@ -450,7 +460,7 @@ func addOauthM2MAuthenticator(clientId, clientSecret string, config *UserConfig)
 }
 
 func addOauthU2MAuthenticator(config *UserConfig) error {
-	u2m, err := u2m.NewAuthenticator(config.Host, 0)
+	u2m, err := u2m.NewAuthenticator(config.Host, 0, config.OAuthRedirectPort)
 	if err == nil {
 		config.Authenticator = u2m
 	}
