@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +66,13 @@ func NewAuthenticator(hostName string, timeout time.Duration, port int) (auth.Au
 		return nil, fmt.Errorf("unable to generate oauth2.Config: %w", err)
 	}
 
-	tsp, err := GetTokenSourceProvider(context.Background(), config, timeout)
+	// Initialize token cache for cross-process coordination
+	tokenCache, err := newTokenCache()
+	if err != nil {
+		return nil, fmt.Errorf("unable to initialize token cache: %w", err)
+	}
+
+	tsp, err := GetTokenSourceProvider(context.Background(), config, timeout, tokenCache, hostName)
 
 	return &u2mAuthenticator{
 		clientID: clientID,
@@ -80,8 +86,10 @@ type u2mAuthenticator struct {
 	hostName string
 	// scopes      []string
 	tokenSource oauth2.TokenSource
-	tsp         *tokenSourceProvider
+	tokenError  error // Cache GetTokenSource error
+	tsp         tokenSourceProviderInterface
 	mx          sync.Mutex
+	once        sync.Once // Ensure GetTokenSource is only called once
 }
 
 // Auth will start the OAuth Authorization Flow to authenticate the cli client
@@ -89,32 +97,24 @@ type u2mAuthenticator struct {
 func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 	c.mx.Lock()
 	defer c.mx.Unlock()
-	if c.tokenSource != nil {
-		token, err := c.tokenSource.Token()
-		if err == nil {
-			token.SetAuthHeader(r)
-			return nil
-		} else if !strings.Contains(err.Error(), "invalid_grant") {
-			return err
-		}
 
-		token.SetAuthHeader(r)
-		return nil
+	// Ensure GetTokenSource is only called once (success or failure)
+	c.once.Do(func() {
+		c.tokenSource, c.tokenError = c.tsp.GetTokenSource()
+	})
+
+	// If GetTokenSource failed, return cached error
+	if c.tokenError != nil {
+		return fmt.Errorf("unable to get token source: %w", c.tokenError)
 	}
 
-	tokenSource, err := c.tsp.GetTokenSource()
+	// Get fresh token from the token source
+	token, err := c.tokenSource.Token()
 	if err != nil {
-		return fmt.Errorf("unable to get token source: %w", err)
-	}
-	c.tokenSource = tokenSource
-
-	token, err := tokenSource.Token()
-	if err != nil {
-		return fmt.Errorf("unable to get token source: %w", err)
+		return err
 	}
 
 	token.SetAuthHeader(r)
-
 	return nil
 }
 
@@ -125,6 +125,10 @@ type authResponse struct {
 	code    string
 }
 
+type tokenSourceProviderInterface interface {
+	GetTokenSource() (oauth2.TokenSource, error)
+}
+
 type tokenSourceProvider struct {
 	timeout     time.Duration
 	state       string
@@ -132,13 +136,79 @@ type tokenSourceProvider struct {
 	authDoneCh  chan authResponse
 	redirectURL *url.URL
 	config      oauth2.Config
+	tokenCache  *tokenCache
+	hostname    string
 }
 
 func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
+	ctx := context.Background()
+
+	// Step 1: Try to read cached token first
+	if token, err := tsp.tokenCache.readToken(tsp.hostname); err == nil && token != nil {
+		log.Info().Msg("Using cached OAuth token")
+		return tsp.config.TokenSource(ctx, token), nil
+	}
+
+	// Step 2: Try to acquire lease to perform OAuth flow
+	lease, acquired := tsp.tokenCache.tryAcquireLease()
+
+	if acquired {
+		// We got the lease - perform OAuth flow
+		defer lease.Release()
+		log.Info().Msg("Acquired OAuth flow lease, starting browser authentication")
+
+		tokenSource, err := tsp.performOAuthFlow()
+		if err != nil {
+			return nil, err
+		}
+
+		// Cache the token for other processes
+		if token, err := tokenSource.Token(); err == nil {
+			if err := tsp.tokenCache.writeToken(tsp.hostname, token); err != nil {
+				log.Warn().Err(err).Msg("Failed to cache OAuth token")
+			} else {
+				log.Info().Msg("OAuth token cached successfully")
+			}
+		}
+
+		return tokenSource, nil
+	}
+
+	// Step 3: Someone else has the lease - wait for them to complete OAuth and cache the token
+	log.Info().Msg("Another process is performing OAuth authentication, waiting for cached token...")
+
+	// Use exponential backoff with jitter to avoid thundering herd
+	baseInterval := minRetryInterval
+	maxInterval := maxRetryInterval
+	deadline := time.Now().Add(tsp.timeout)
+
+	for time.Now().Before(deadline) {
+		// Wait with jitter: random interval between baseInterval and maxInterval
+		jitter := time.Duration(mathrand.Int63n(int64(maxInterval-baseInterval))) + baseInterval
+		remaining := deadline.Sub(time.Now())
+		if jitter > remaining {
+			jitter = remaining
+		}
+		time.Sleep(jitter)
+
+		if token, err := tsp.tokenCache.readToken(tsp.hostname); err == nil && token != nil {
+			log.Info().Msg("OAuth token cached by another process, using it")
+			return tsp.config.TokenSource(ctx, token), nil
+		}
+
+		// Exponential backoff for next iteration
+		baseInterval = maxInterval / 2
+		maxInterval = min(maxInterval*2, 10*time.Second)
+	}
+
+	return nil, errors.New("timed out waiting for OAuth token from another process")
+}
+
+// performOAuthFlow executes the actual OAuth browser flow
+func (tsp *tokenSourceProvider) performOAuthFlow() (oauth2.TokenSource, error) {
 	state, err := randString(16)
 	if err != nil {
-		err = fmt.Errorf("unable to generate random number: %w", err)
-		return nil, err
+		return nil, fmt.Errorf("unable to generate random number: %w", err)
 	}
 
 	challenge, challengeMethod, verifier, err := GetAuthCodeOptions()
@@ -156,9 +226,14 @@ func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
 	}
 	defer listener.Close()
 
+	// Create a dedicated mux for this server (not global DefaultServeMux)
+	mux := http.NewServeMux()
+	mux.Handle(tsp.redirectURL.Path, tsp)
+
 	srv := &http.Server{
 		ReadHeaderTimeout: 3 * time.Second,
 		WriteTimeout:      30 * time.Second,
+		Handler:           mux,
 	}
 
 	defer srv.Close()
@@ -202,6 +277,11 @@ func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
 }
 
 func (tsp *tokenSourceProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.String() == "/favicon.ico" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
 	resp := authResponse{
 		err:     r.URL.Query().Get("error"),
 		details: r.URL.Query().Get("error_description"),
@@ -209,7 +289,15 @@ func (tsp *tokenSourceProvider) ServeHTTP(w http.ResponseWriter, r *http.Request
 		code:    r.URL.Query().Get("code"),
 	}
 
-	// Send the response back to the to cli
+	// Ignore empty requests (could be pre-flight, etc.)
+	if resp.state == "" && resp.code == "" && resp.err == "" {
+		log.Debug().Msg("Ignoring empty request (likely browser auto-complete or pre-flight)")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(infoHTML("Waiting for Authentication", "Please complete the login in the Databricks window.")))
+		return
+	}
+
+	// Send the response back to the CLI
 	defer func() { tsp.authDoneCh <- resp }()
 
 	// Do some checking of the response here to show more relevant content
@@ -222,11 +310,11 @@ func (tsp *tokenSourceProvider) ServeHTTP(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	if resp.state != tsp.state && r.URL.String() != "/favicon.ico" {
-		msg := "Authentication state received did not match original request. Please try to login again."
-		log.Error().Msg(msg)
+	if resp.state != tsp.state {
+		msg := fmt.Sprintf("Authentication state mismatch: expected '%s', got '%s'. This may be from an old browser window.", tsp.state, resp.state)
+		log.Warn().Msg(msg)
 		w.WriteHeader(http.StatusBadRequest)
-		_, err := w.Write([]byte(errorHTML(msg)))
+		_, err := w.Write([]byte(errorHTML("Authentication state mismatch. Please close this window and use the correct browser tab.")))
 		if err != nil {
 			log.Error().Err(err).Msg("unable to write error response")
 		}
@@ -239,9 +327,7 @@ func (tsp *tokenSourceProvider) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 }
 
-var register sync.Once = sync.Once{}
-
-func GetTokenSourceProvider(ctx context.Context, config oauth2.Config, timeout time.Duration) (*tokenSourceProvider, error) {
+func GetTokenSourceProvider(ctx context.Context, config oauth2.Config, timeout time.Duration, tokenCache *tokenCache, hostname string) (*tokenSourceProvider, error) {
 	if timeout == 0 {
 		timeout = 2 * time.Minute
 	}
@@ -264,10 +350,12 @@ func GetTokenSourceProvider(ctx context.Context, config oauth2.Config, timeout t
 		authDoneCh:  authDoneCh,
 		redirectURL: u,
 		config:      config,
+		tokenCache:  tokenCache,
+		hostname:    hostname,
 	}
 
-	f := func() { http.Handle(u.Path, tsp) }
-	register.Do(f)
+	// Note: Handler registration happens in GetTokenSource() where
+	// each server gets its own dedicated handler
 
 	return tsp, nil
 }
