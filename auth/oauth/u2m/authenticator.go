@@ -86,10 +86,9 @@ type u2mAuthenticator struct {
 	hostName string
 	// scopes      []string
 	tokenSource oauth2.TokenSource
-	tokenError  error // Cache GetTokenSource error
+	tokenError  error // Cached GetTokenSource error
 	tsp         tokenSourceProviderInterface
 	mx          sync.Mutex
-	once        sync.Once // Ensure GetTokenSource is only called once
 }
 
 // Auth will start the OAuth Authorization Flow to authenticate the cli client
@@ -98,23 +97,39 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 	c.mx.Lock()
 	defer c.mx.Unlock()
 
-	// Ensure GetTokenSource is only called once (success or failure)
-	c.once.Do(func() {
-		c.tokenSource, c.tokenError = c.tsp.GetTokenSource()
-	})
-
-	// If GetTokenSource failed, return cached error
-	if c.tokenError != nil {
-		return fmt.Errorf("unable to get token source: %w", c.tokenError)
+	// Lazy init or re-init token source if needed
+	if c.tokenSource == nil {
+		ts, err := c.tsp.GetTokenSource()
+		if err != nil {
+			c.tokenError = err
+			return fmt.Errorf("unable to get token source: %w", err)
+		}
+		c.tokenSource = ts
+		c.tokenError = nil
 	}
 
-	// Get fresh token from the token source
+	// Attempt to get token; on failure, try one re-init
 	token, err := c.tokenSource.Token()
 	if err != nil {
-		return err
+		// Clear and retry once
+		c.tokenSource = nil
+		ts, err2 := c.tsp.GetTokenSource()
+		if err2 != nil {
+			return err
+		}
+		c.tokenSource = ts
+		token, err = c.tokenSource.Token()
+		if err != nil {
+			return err
+		}
 	}
 
 	token.SetAuthHeader(r)
+
+	// Persist token to cache
+	if tspImpl, ok := c.tsp.(*tokenSourceProvider); ok && tspImpl.tokenCache != nil {
+		_ = tspImpl.tokenCache.writeToken(c.hostName, token)
+	}
 	return nil
 }
 
