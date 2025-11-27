@@ -53,7 +53,7 @@ type mockTokenSourceProvider struct {
 	maxConcurrentCalls int
 }
 
-func (m *mockTokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
+func (m *mockTokenSourceProvider) GetTokenSource(optionalLease *Lease) (oauth2.TokenSource, error) {
 	m.mu.Lock()
 	m.calls++
 	m.activeCallsCount++
@@ -184,61 +184,61 @@ func TestU2MAuthenticator_Authenticate(t *testing.T) {
 }
 
 func TestU2MAuthenticator_RetryInitOnTokenError(t *testing.T) {
-    // Initial token source fails
-    failingTS := &mockTokenSource{err: fmt.Errorf("initial token error")}
+	// Initial token source fails
+	failingTS := &mockTokenSource{err: fmt.Errorf("initial token error")}
 
-    // Provider returns a working token source on re-init
-    goodToken := &oauth2.Token{AccessToken: "new_token", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)}
-    goodTS := &mockTokenSource{token: goodToken}
-    provider := &mockTokenSourceProvider{tokenSource: goodTS}
+	// Provider returns a working token source on re-init
+	goodToken := &oauth2.Token{AccessToken: "new_token", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)}
+	goodTS := &mockTokenSource{token: goodToken}
+	provider := &mockTokenSourceProvider{tokenSource: goodTS}
 
-    auth := &u2mAuthenticator{
-        clientID:    "test-client",
-        hostName:    "h",
-        tokenSource: failingTS,
-        tsp:         provider,
-    }
+	auth := &u2mAuthenticator{
+		clientID:    "test-client",
+		hostName:    "h",
+		tokenSource: failingTS,
+		tsp:         provider,
+	}
 
-    req := httptest.NewRequest("GET", "http://h/api", nil)
-    err := auth.Authenticate(req)
-    assert.NoError(t, err)
-    assert.Equal(t, "Bearer new_token", req.Header.Get("Authorization"))
-    assert.Equal(t, 1, provider.CallCount())
+	req := httptest.NewRequest("GET", "http://h/api", nil)
+	err := auth.Authenticate(req)
+	assert.NoError(t, err)
+	assert.Equal(t, "Bearer new_token", req.Header.Get("Authorization"))
+	assert.Equal(t, 1, provider.CallCount())
 }
 
 func TestU2MAuthenticator_PersistsTokenToCache(t *testing.T) {
-    tmp := t.TempDir()
+	tmp := t.TempDir()
 
-    // Build a token cache bound to temp dir
-    leasePath := filepath.Join(tmp, "lease")
-    lh, err := NewLeaseHandler(leasePath, leaseTimeout)
-    assert.NoError(t, err)
-    tc := &tokenCache{cacheDir: tmp, leaseHandler: lh, memCache: make(map[string]*oauth2.Token)}
+	// Build a token cache bound to temp dir
+	leasePath := filepath.Join(tmp, "lease")
+	lh, err := NewLeaseHandler(leasePath, leaseTimeout)
+	assert.NoError(t, err)
+	tc := &tokenCache{cacheDir: tmp, leaseHandler: lh, memCache: make(map[string]*oauth2.Token)}
 
-    // Provider instance carrying the token cache
-    tsp := &tokenSourceProvider{
-        timeout:     500 * time.Millisecond,
-        sigintCh:    make(chan os.Signal, 1),
-        authDoneCh:  make(chan authResponse),
-        redirectURL: &url.URL{Scheme: "http", Host: "localhost:8039", Path: "/"},
-        tokenCache:  tc,
-        hostname:    "workspace-1",
-    }
+	// Provider instance carrying the token cache
+	tsp := &tokenSourceProvider{
+		timeout:     500 * time.Millisecond,
+		sigintCh:    make(chan os.Signal, 1),
+		authDoneCh:  make(chan authResponse),
+		redirectURL: &url.URL{Scheme: "http", Host: "localhost:8039", Path: "/"},
+		tokenCache:  tc,
+		hostname:    "workspace-1",
+	}
 
-    tok := &oauth2.Token{AccessToken: "persist_me", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)}
-    ts := &mockTokenSource{token: tok}
+	tok := &oauth2.Token{AccessToken: "persist_me", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)}
+	ts := &mockTokenSource{token: tok}
 
-    auth := &u2mAuthenticator{clientID: "c", hostName: "workspace-1", tokenSource: ts, tsp: tsp}
+	auth := &u2mAuthenticator{clientID: "c", hostName: "workspace-1", tokenSource: ts, tsp: tsp}
 
-    req := httptest.NewRequest("GET", "http://workspace-1/api", nil)
-    err = auth.Authenticate(req)
-    assert.NoError(t, err)
+	req := httptest.NewRequest("GET", "http://workspace-1/api", nil)
+	err = auth.Authenticate(req)
+	assert.NoError(t, err)
 
-    // Verify token written to cache file
-    path := tc.getCacheFilePath("workspace-1")
-    data, readErr := os.ReadFile(path)
-    assert.NoError(t, readErr)
-    assert.Contains(t, string(data), "persist_me")
+	// Verify token written to cache file
+	path := tc.getCacheFilePath("workspace-1")
+	data, readErr := os.ReadFile(path)
+	assert.NoError(t, readErr)
+	assert.Contains(t, string(data), "persist_me")
 }
 
 func TestU2MAuthenticator_ConcurrentAuthentication(t *testing.T) {
@@ -347,7 +347,7 @@ func TestTokenSourceProvider_GetTokenSource(t *testing.T) {
 		}
 
 		// Call GetTokenSource without sending a callback
-		_, err := tsp.GetTokenSource()
+		_, err := tsp.GetTokenSource(nil)
 
 		assert.NotNil(t, err)
 		assert.Contains(t, err.Error(), "timed out waiting for response")

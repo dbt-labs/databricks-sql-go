@@ -30,13 +30,10 @@ const (
 	awsClientId = "databricks-sql-connector"
 
 	gcpClientId = "databricks-sql-connector"
-
-	defaultPort = 8030
 )
 
 // NewAuthenticator creates a new U2M OAuth authenticator.
 // The port parameter specifies the local port for the OAuth redirect callback.
-// If port is 0, the default port (8030) will be used.
 // Example DSN usage: "https://host?authType=databricks-oauth&oauthRedirectPort=9000"
 func NewAuthenticator(hostName string, timeout time.Duration, port int) (auth.Authenticator, error) {
 
@@ -51,11 +48,6 @@ func NewAuthenticator(hostName string, timeout time.Duration, port int) (auth.Au
 		clientID = gcpClientId
 	} else {
 		return nil, errors.New("unhandled cloud type: " + cloud.String())
-	}
-
-	// Use default port if not specified
-	if port == 0 {
-		port = defaultPort
 	}
 
 	redirectURL := fmt.Sprintf("localhost:%d", port)
@@ -97,9 +89,9 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 	c.mx.Lock()
 	defer c.mx.Unlock()
 
-	// Lazy init or re-init token source if needed
+	// Step 1. Lazy init or re-init token source if needed
 	if c.tokenSource == nil {
-		ts, err := c.tsp.GetTokenSource()
+		ts, err := c.tsp.GetTokenSource(nil)
 		if err != nil {
 			c.tokenError = err
 			return fmt.Errorf("unable to get token source: %w", err)
@@ -108,12 +100,24 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 		c.tokenError = nil
 	}
 
-	// Attempt to get token; on failure, try one re-init
+	// Step 2. Attempt to get token; on failure, try one re-init
+	// Always acquire a lease to safely persist to disk or
+	// guarantee a single process re-auths
 	token, err := c.tokenSource.Token()
+
+	var lease *Lease
+	if tspImpl, ok := c.tsp.(*tokenSourceProvider); ok && tspImpl.tokenCache != nil {
+		lease, _ = tspImpl.tokenCache.acquireLease()
+	}
+	if lease != nil {
+		defer lease.Release()
+	}
+
+	// Token was invalid - we need to retry
 	if err != nil {
 		// Clear and retry once
 		c.tokenSource = nil
-		ts, err2 := c.tsp.GetTokenSource()
+		ts, err2 := c.tsp.GetTokenSource(lease)
 		if err2 != nil {
 			return err
 		}
@@ -126,9 +130,9 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 
 	token.SetAuthHeader(r)
 
-	// Persist token to cache
+	// Step 3. Persist token to cache
 	if tspImpl, ok := c.tsp.(*tokenSourceProvider); ok && tspImpl.tokenCache != nil {
-		_ = tspImpl.tokenCache.writeToken(c.hostName, token)
+		_ = tspImpl.tokenCache.writeToken(lease, c.hostName, token)
 	}
 	return nil
 }
@@ -141,7 +145,7 @@ type authResponse struct {
 }
 
 type tokenSourceProviderInterface interface {
-	GetTokenSource() (oauth2.TokenSource, error)
+	GetTokenSource(optionalLease *Lease) (oauth2.TokenSource, error)
 }
 
 type tokenSourceProvider struct {
@@ -155,21 +159,39 @@ type tokenSourceProvider struct {
 	hostname    string
 }
 
-func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
+// Returns a TokenSource
+// An optional lease can be provided. If a lease is provided, we will favor
+// performing the OAuth flow
+// If no lease is provided, we will look in the order of:
+// 1. Relaxed Read from disk
+// 2. Perform OAuth Flow (if lease can be acquired)
+// 3. Wait for cached token (if lease could not be acquired)
+func (tsp *tokenSourceProvider) GetTokenSource(optionalLease *Lease) (oauth2.TokenSource, error) {
 	ctx := context.Background()
 
-	// Step 1: Try to read cached token first
-	if token, err := tsp.tokenCache.readToken(tsp.hostname); err == nil && token != nil {
-		log.Info().Msg("Using cached OAuth token")
-		return tsp.config.TokenSource(ctx, token), nil
+	// Step 1: Try to read cached token first (if allowed)
+	// INVARIANT 1: Lease Provided -> Skip reading from cache
+	// INVARIANT 2: Lease is nil -> Read from cache if possible
+	if optionalLease == nil {
+		if token, err := tsp.tokenCache.readTokenRelaxed(tsp.hostname); err == nil && token != nil {
+			log.Info().Msg("Using cached OAuth token")
+			return tsp.config.TokenSource(ctx, token), nil
+		}
 	}
 
 	// Step 2: Try to acquire lease to perform OAuth flow
-	lease, acquired := tsp.tokenCache.tryAcquireLease()
+	// INVARIANT 1: Lease Provided -> Perform OAuth flow. Keep lease alive.
+	// INVARIANT 2: Lease is nil -> Attempt to acquire lease and perform OAuth if acquired. Release lease at end of execution.
+	lease, acquired := optionalLease, optionalLease != nil
+	if lease == nil {
+		lease, acquired = tsp.tokenCache.tryAcquireLease()
+		if acquired && lease != nil {
+			defer lease.Release()
+		}
+	}
 
 	if acquired {
-		// We got the lease - perform OAuth flow
-		defer lease.Release()
+		// We have a lease - perform OAuth flow
 		log.Info().Msg("Acquired OAuth flow lease, starting browser authentication")
 
 		tokenSource, err := tsp.performOAuthFlow()
@@ -179,7 +201,7 @@ func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
 
 		// Cache the token for other processes
 		if token, err := tokenSource.Token(); err == nil {
-			if err := tsp.tokenCache.writeToken(tsp.hostname, token); err != nil {
+			if err := tsp.tokenCache.writeToken(lease, tsp.hostname, token); err != nil {
 				log.Warn().Err(err).Msg("Failed to cache OAuth token")
 			} else {
 				log.Info().Msg("OAuth token cached successfully")
@@ -206,7 +228,7 @@ func (tsp *tokenSourceProvider) GetTokenSource() (oauth2.TokenSource, error) {
 		}
 		time.Sleep(jitter)
 
-		if token, err := tsp.tokenCache.readToken(tsp.hostname); err == nil && token != nil {
+		if token, err := tsp.tokenCache.readTokenRelaxed(tsp.hostname); err == nil && token != nil {
 			log.Info().Msg("OAuth token cached by another process, using it")
 			return tsp.config.TokenSource(ctx, token), nil
 		}

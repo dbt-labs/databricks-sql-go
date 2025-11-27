@@ -36,7 +36,7 @@ type tokenCache struct {
 	cacheDir     string
 	leaseHandler *LeaseHandler
 
-	// In-memory cache to avoid file reads on every token access
+	// In-memory cache to allow relaxed reads (allowed to be stale relative to persisted values)
 	mu       sync.RWMutex
 	memCache map[string]*oauth2.Token // hostname -> token
 }
@@ -94,8 +94,8 @@ func (tc *tokenCache) getCacheFilePath(hostname string) string {
 	return filepath.Join(tc.cacheDir, fmt.Sprintf("%s_%s", hostname, tokenCacheFileName))
 }
 
-// readToken reads a cached token, first from memory, then from disk
-func (tc *tokenCache) readToken(hostname string) (*oauth2.Token, error) {
+// readTokenRelaxed reads a cached token, first from memory, then from disk
+func (tc *tokenCache) readTokenRelaxed(hostname string) (*oauth2.Token, error) {
 	// Fast path: check in-memory cache first (no lock needed for reads)
 	tc.mu.RLock()
 	if cached, ok := tc.memCache[hostname]; ok && cached.Valid() {
@@ -153,7 +153,7 @@ func (tc *tokenCache) readTokenFromDisk(hostname string) (*oauth2.Token, error) 
 }
 
 // writeToken writes a token to the cache file and in-memory cache
-func (tc *tokenCache) writeToken(hostname string, token *oauth2.Token) error {
+func (tc *tokenCache) writeToken(lease *Lease, hostname string, token *oauth2.Token) error {
 	path := tc.getCacheFilePath(hostname)
 
 	entry := tokenCacheEntry{
