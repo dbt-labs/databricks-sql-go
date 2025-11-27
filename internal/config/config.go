@@ -163,6 +163,9 @@ func (ucfg UserConfig) WithDefaults() UserConfig {
 	if ucfg.Port == 0 {
 		ucfg.Port = 443
 	}
+	if ucfg.OAuthRedirectPort == 0 {
+		ucfg.Port = 8030
+	}
 	if ucfg.Authenticator == nil {
 		ucfg.Authenticator = &noop.NoopAuth{}
 	}
