@@ -199,15 +199,6 @@ func (tsp *tokenSourceProvider) GetTokenSource(optionalLease *Lease) (oauth2.Tok
 			return nil, err
 		}
 
-		// Cache the token for other processes
-		if token, err := tokenSource.Token(); err == nil {
-			if err := tsp.tokenCache.writeToken(lease, tsp.hostname, token); err != nil {
-				log.Warn().Err(err).Msg("Failed to cache OAuth token")
-			} else {
-				log.Info().Msg("OAuth token cached successfully")
-			}
-		}
-
 		return tokenSource, nil
 	}
 
