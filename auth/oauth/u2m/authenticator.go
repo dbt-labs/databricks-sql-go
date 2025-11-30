@@ -105,6 +105,19 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 	// guarantee a single process re-auths
 	token, err := c.tokenSource.Token()
 
+	// Before acquiring a lease for auth, attempt a single retry through normal flow
+	// in case another thread has written to the cache
+	if err != nil {
+		c.tokenSource = nil
+		ts, err2 := c.tsp.GetTokenSource(nil)
+		if err2 != nil {
+			return fmt.Errorf("unable to get token source: %w", err)
+		}
+		c.tokenSource = ts
+		token, err = c.tokenSource.Token()
+	}
+
+	// Lease for write or for locked retry
 	var lease *Lease
 	if tspImpl, ok := c.tsp.(*tokenSourceProvider); ok && tspImpl.tokenCache != nil {
 		lease, _ = tspImpl.tokenCache.acquireLease()
@@ -113,7 +126,7 @@ func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 		defer lease.Release()
 	}
 
-	// Token was invalid - we need to retry
+	// Locked retry with lease
 	if err != nil {
 		// Clear and retry once
 		c.tokenSource = nil
