@@ -26,7 +26,7 @@ func testU2M() {
 		log.Fatal(err.Error())
 	}
 
-	authenticator, err := u2m.NewAuthenticator(os.Getenv("DATABRICKS_HOST"), 1*time.Minute)
+	authenticator, err := u2m.NewAuthenticator(os.Getenv("DATABRICKS_HOST"), 1*time.Minute, 8030)
 
 	if err != nil {
 		log.Fatal(err.Error())

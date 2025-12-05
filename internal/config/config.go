@@ -101,6 +101,7 @@ type UserConfig struct {
 	Transport                http.RoundTripper
 	UseLz4Compression        bool
 	EnableMetricViewMetadata bool
+	OAuthRedirectPort        int // Port for OAuth U2M redirect callback (default: 8030)
 	CloudFetchConfig
 }
 
@@ -143,6 +144,7 @@ func (ucfg UserConfig) DeepCopy() UserConfig {
 		Transport:                ucfg.Transport,
 		UseLz4Compression:        ucfg.UseLz4Compression,
 		EnableMetricViewMetadata: ucfg.EnableMetricViewMetadata,
+		OAuthRedirectPort:        ucfg.OAuthRedirectPort,
 		CloudFetchConfig:         ucfg.CloudFetchConfig,
 	}
 }
@@ -160,6 +162,9 @@ func (ucfg UserConfig) WithDefaults() UserConfig {
 	}
 	if ucfg.Port == 0 {
 		ucfg.Port = 443
+	}
+	if ucfg.OAuthRedirectPort == 0 {
+		ucfg.Port = 8030
 	}
 	if ucfg.Authenticator == nil {
 		ucfg.Authenticator = &noop.NoopAuth{}
@@ -257,6 +262,13 @@ func ParseDSN(dsn string) (UserConfig, error) {
 	}
 	if schema, ok := params.extract("schema"); ok {
 		ucfg.Schema = schema
+	}
+
+	if oauthRedirectPort, ok, err := params.extractAsInt("oauthRedirectPort"); ok {
+		if err != nil {
+			return UserConfig{}, err
+		}
+		ucfg.OAuthRedirectPort = oauthRedirectPort
 	}
 
 	// Cloud Fetch parameters
@@ -373,7 +385,7 @@ func addOauthM2MAuthenticator(clientId, clientSecret string, config *UserConfig)
 }
 
 func addOauthU2MAuthenticator(config *UserConfig) error {
-	u2m, err := u2m.NewAuthenticator(config.Host, 0)
+	u2m, err := u2m.NewAuthenticator(config.Host, 0, config.OAuthRedirectPort)
 	if err == nil {
 		config.Authenticator = u2m
 	}
