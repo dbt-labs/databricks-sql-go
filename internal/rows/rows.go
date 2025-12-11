@@ -550,15 +550,6 @@ func (r *rows) GetArrowIPCStreams(ctx context.Context) (dbsqlrows.ArrowIPCStream
 		return r.RowScanner.GetArrowIPCStreams(ctx, *r.config, r.ResultPageIterator)
 	}
 
-	// Ensure metadata is available to get arrow schema bytes
-	if r.resultSetMetadata == nil {
-		// Fetch metadata if not already available
-		_, err := r.getResultSetSchema()
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// Get arrow schema bytes from metadata (generates from TTableSchema if ArrowSchema not available)
 	arrowSchemaBytes, err := arrowbased.GetArrowSchemaBytes(r.resultSetMetadata, r.config, ctx)
 	if err != nil {
