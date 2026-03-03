@@ -73,7 +73,7 @@ type u2mAuthenticator struct {
 	hostName string
 	// scopes      []string
 	tokenSource oauth2.TokenSource
-	tsp         *tokenSourceProvider
+	tsp         tokenSourceProviderInterface
 	mx          sync.Mutex
 }
 
@@ -82,33 +82,46 @@ type u2mAuthenticator struct {
 func (c *u2mAuthenticator) Authenticate(r *http.Request) error {
 	c.mx.Lock()
 	defer c.mx.Unlock()
-	if c.tokenSource != nil {
-		token, err := c.tokenSource.Token()
-		if err == nil {
-			token.SetAuthHeader(r)
-			return nil
-		} else if !strings.Contains(err.Error(), "invalid_grant") {
+
+	// Lazy-init token source.
+	if c.tokenSource == nil {
+		tokenSource, err := c.tsp.GetTokenSource()
+		if err != nil {
+			return fmt.Errorf("unable to get token source: %w", err)
+		}
+		c.tokenSource = tokenSource
+	}
+
+	token, err := c.tokenSource.Token()
+	if err != nil {
+		if !strings.Contains(err.Error(), "invalid_grant") {
 			return err
 		}
 
-		token.SetAuthHeader(r)
-		return nil
+		c.tokenSource = nil
+		tokenSource, sourceErr := c.tsp.GetTokenSource()
+		if sourceErr != nil {
+			return fmt.Errorf("unable to get token source: %w", sourceErr)
+		}
+		c.tokenSource = tokenSource
+
+		token, err = c.tokenSource.Token()
+		if err != nil {
+			return err
+		}
 	}
 
-	tokenSource, err := c.tsp.GetTokenSource()
-	if err != nil {
-		return fmt.Errorf("unable to get token source: %w", err)
-	}
-	c.tokenSource = tokenSource
-
-	token, err := tokenSource.Token()
-	if err != nil {
-		return fmt.Errorf("unable to get token source: %w", err)
+	if token == nil {
+		return errors.New("received nil token from token source")
 	}
 
 	token.SetAuthHeader(r)
 
 	return nil
+}
+
+type tokenSourceProviderInterface interface {
+	GetTokenSource() (oauth2.TokenSource, error)
 }
 
 type authResponse struct {
