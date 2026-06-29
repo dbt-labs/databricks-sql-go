@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -651,9 +652,21 @@ func errorHandler(resp *http.Response, err error, numTries int) (*http.Response,
 		}
 
 		logger.Err(werr).Msg(resp.Status)
+
+		// Per the http.RoundTripper contract a transport must return either a
+		// response or an error, never both. retryablehttp's StandardClient passes
+		// our return value straight to net/http, which discards any response
+		// returned alongside an error (logging "RoundTripper returned a response &
+		// error; ignoring response") and surfaces only the error. Returning the
+		// response here therefore leaks the connection and produces a confusing
+		// "connection is already closed" failure downstream, so we drain and close
+		// the body and return only the (already enriched) error, matching
+		// retryablehttp's own default ErrorHandler behaviour.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 	}
 
-	return resp, werr
+	return nil, werr
 }
 
 var (

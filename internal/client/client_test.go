@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"database/sql/driver"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -47,6 +48,41 @@ func TestSprintByteId(t *testing.T) {
 			}
 		})
 	}
+}
+
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestErrorHandler(t *testing.T) {
+	// errorHandler is used as retryablehttp's ErrorHandler, whose return value is
+	// passed straight back to net/http. The http.RoundTripper contract forbids
+	// returning a response together with an error: net/http would log
+	// "RoundTripper returned a response & error; ignoring response", discard the
+	// response and leak its body. errorHandler must therefore drain and close the
+	// body and return a nil response alongside the (enriched) error.
+	t.Run("returns nil response and closes body to honour the RoundTripper contract", func(t *testing.T) {
+		body := &closeTrackingBody{Reader: strings.NewReader("upstream error body")}
+		resp := &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Header:     http.Header{"X-Databricks-Reason-Phrase": []string{"upstream timeout"}},
+			Body:       body,
+		}
+
+		gotResp, gotErr := errorHandler(resp, errors.New("idle timeout"), 4)
+
+		require.Nil(t, gotResp, "errorHandler must not return a response alongside an error")
+		require.Error(t, gotErr)
+		require.Contains(t, gotErr.Error(), "upstream timeout")
+		require.True(t, body.closed, "response body must be drained and closed to avoid leaking the connection")
+	})
 }
 
 func TestRetryPolicy(t *testing.T) {

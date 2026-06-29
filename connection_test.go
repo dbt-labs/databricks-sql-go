@@ -815,6 +815,44 @@ func TestConn_pollOperation(t *testing.T) {
 		assert.GreaterOrEqual(t, 1, cancelOperationCount)
 		assert.Nil(t, res)
 	})
+
+	t.Run("pollOperation keeps polling after a transient GetOperationStatus error", func(t *testing.T) {
+		// While a query runs server-side its operation handle stays valid, so a
+		// transient failure to read its status must not abandon the query. The
+		// first poll fails, the second succeeds; pollOperation should swallow the
+		// error, keep polling, and ultimately return the finished state.
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			if getOperationStatusCount == 1 {
+				return nil, errors.New("transient connection reset")
+			}
+			return &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+			}, nil
+		}
+		testClient := &client.TestClient{
+			FnGetOperationStatus: getOperationStatus,
+		}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = 50 * time.Millisecond
+		testConn := &conn{
+			session: getTestSession(),
+			client:  testClient,
+			cfg:     cfg,
+		}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{
+				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 9, 4, 4, 223, 34, 54},
+				Secret: []byte("b"),
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, 2, getOperationStatusCount)
+		assert.Equal(t, cli_service.TGetOperationStatusResp{
+			OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+		}, *res)
+	})
 }
 
 func TestConn_runQuery(t *testing.T) {
