@@ -362,12 +362,24 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 	return resp, err
 }
 
+// maxPollFailureWindow bounds how long pollOperation will keep retrying after
+// GetOperationStatus starts failing. While a query runs server-side its
+// operation handle stays valid, so a transient failure to read its status (an
+// idle-timed-out connection, a connection reset, a 5xx, an EOF, ...) must not
+// abandon an otherwise-healthy long-running query. We tolerate such failures for
+// up to this window before giving up, so that a genuinely unreachable warehouse
+// still terminates the poll instead of hanging forever.
+const maxPollFailureWindow = 5 * time.Minute
+
 func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperationHandle) (*cli_service.TGetOperationStatusResp, error) {
 	corrId := driverctx.CorrelationIdFromContext(ctx)
 	log := logger.WithContext(c.id, corrId, client.SprintGuid(opHandle.OperationId.GUID))
 	var statusResp *cli_service.TGetOperationStatusResp
 	ctx = driverctx.NewContextWithConnId(ctx, c.id)
 	newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
+	// Tracks the start of the current run of consecutive GetOperationStatus
+	// failures; zero when the last poll succeeded.
+	var firstFailure time.Time
 	pollSentinel := sentinel.Sentinel{
 		OnDoneFn: func(statusResp any) (any, error) {
 			return statusResp, nil
@@ -379,13 +391,33 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 				OperationHandle: opHandle,
 			})
 
+			if err != nil {
+				// If the caller's context is done, abort immediately and let the
+				// sentinel surface the cancellation/deadline.
+				if ctx.Err() != nil {
+					return func() bool { return true }, statusResp, err
+				}
+				now := time.Now()
+				if firstFailure.IsZero() {
+					firstFailure = now
+				}
+				elapsed := now.Sub(firstFailure)
+				if elapsed >= maxPollFailureWindow {
+					log.Err(err).Msgf("databricks: giving up polling operation status after %s of consecutive failures", elapsed)
+					return func() bool { return true }, statusResp, err
+				}
+				// The query is still running server-side; swallow the transient
+				// error (do not return it, or the sentinel would abort) and keep
+				// polling on the next interval.
+				log.Warn().Msgf("databricks: transient error polling operation status, will retry (failing for %s): %v", elapsed, err)
+				return func() bool { return false }, statusResp, nil
+			}
+			firstFailure = time.Time{}
+
 			if statusResp != nil && statusResp.OperationState != nil {
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
 			}
 			return func() bool {
-				if err != nil {
-					return true
-				}
 				switch statusResp.GetOperationState() {
 				case cli_service.TOperationState_INITIALIZED_STATE,
 					cli_service.TOperationState_PENDING_STATE,
@@ -395,7 +427,7 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 					log.Debug().Msg("databricks: polling done")
 					return true
 				}
-			}, statusResp, err
+			}, statusResp, nil
 		},
 		OnCancelFn: func() (any, error) {
 			log.Debug().Msg("databricks: sentinel canceling query")
