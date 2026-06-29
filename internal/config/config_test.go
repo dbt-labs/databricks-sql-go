@@ -51,7 +51,7 @@ func TestParseConfig(t *testing.T) {
 		},
 		{
 			name: "with https scheme",
-			args: args{dsn: "https://token:supersecret@example.cloud.databricks.com:443/sql/1.0/endpoints/12346a5b5b0e123a"},
+			args: args{dsn: "https://token:supersecret@example.cloud.databricks.com:443/sql/1.0/endpoints/12346a5b5b0e123a"}, //nolint:gosec // G101: test DSN with example password, not a real credential
 			wantCfg: UserConfig{
 				Protocol:         "https",
 				Host:             "example.cloud.databricks.com",
@@ -534,6 +534,29 @@ func TestParseConfig(t *testing.T) {
 				CloudFetchConfig: defCloudConfig,
 			},
 			wantURL: "https://example.cloud.databricks.com:8000/sql/1.0/endpoints/12346a5b5b0e123a",
+			wantErr: false,
+		},
+		{
+			// telemetry_retry_count is accepted for backwards compatibility but
+			// no longer applied; verify the DSN parses without error and the
+			// param is not surfaced as a session param.
+			name: "with telemetry_retry_count=0 (backwards-compat no-op)",
+			args: args{dsn: "token:supersecret@example.cloud.databricks.com:443/sql/1.0/endpoints/12346a5b5b0e123a?telemetry_retry_count=0&telemetry_retry_delay=100ms"},
+			wantCfg: UserConfig{
+				Protocol:         "https",
+				Host:             "example.cloud.databricks.com",
+				Port:             443,
+				MaxRows:          defaultMaxRows,
+				Authenticator:    &pat.PATAuth{AccessToken: "supersecret"},
+				AccessToken:      "supersecret",
+				HTTPPath:         "/sql/1.0/endpoints/12346a5b5b0e123a",
+				SessionParams:    make(map[string]string),
+				RetryMax:         4,
+				RetryWaitMin:     1 * time.Second,
+				RetryWaitMax:     30 * time.Second,
+				CloudFetchConfig: defCloudConfig,
+			},
+			wantURL: "https://example.cloud.databricks.com:443/sql/1.0/endpoints/12346a5b5b0e123a",
 			wantErr: false,
 		},
 		{

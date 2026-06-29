@@ -1,5 +1,34 @@
 # Release History
 
+## v1.13.0 (2026-06-04)
+- Add SPOG (unified) host support: extract the org-id from the cluster HTTP path for non-Thrift requests, and fix U2M/M2M OAuth on unified AWS hosts (databricks/databricks-sql-go#367, #374)
+- Cap CloudFetch Arrow batches to the server-declared row count to avoid over-reading (databricks/databricks-sql-go#372)
+- Detach result streaming from `QueryContext` cancellation so in-flight results aren't dropped when the query context is cancelled (databricks/databricks-sql-go#373)
+
+## v1.12.0 (2026-05-25)
+- Retry transient S3 errors in CloudFetch downloads and staging PUT/GET/REMOVE operations (databricks/databricks-sql-go#355, #361)
+- Telemetry: normalize host key for per-host client + breaker registries; stop retrying into 429s, honour Retry-After, fix userAgent (databricks/databricks-sql-go#354, #364)
+- Bump dependencies to clear Go-1.20-compatible CVEs: golang-jwt, x/net, protobuf, go-jose v3.0.5 (CVE-2026-34986) (databricks/databricks-sql-go#360, #363)
+
+## v1.11.1 (2026-05-20)
+- Fix CloudFetch goroutine leak that retained Arrow buffers after Close (databricks/databricks-sql-go#357)
+
+## v1.11.0 (2026-04-16)
+- Enable telemetry by default with DSN-controlled priority (databricks/databricks-sql-go#320, #321, #322, #349)
+- Add SPOG (Custom URL) routing support via `x-databricks-org-id` header (databricks/databricks-sql-go#347)
+- Add statement-level query tag support (databricks/databricks-sql-go#341)
+- Add AI coding agent detection to User-Agent header (databricks/databricks-sql-go#326)
+- Fix CloudFetch returning stale column names from cached results (databricks/databricks-sql-go#351)
+- Fix resource leak: close staging Rows in execStagingOperation (databricks/databricks-sql-go#325)
+
+## v1.10.0 (2026-02-19)
+- Add token federation / token provider support for OAuth (databricks/databricks-sql-go#290, #291, #292)
+- Internal: add foundational telemetry infrastructure, disabled by default (databricks/databricks-sql-go#297, #304, #305, #311, #319)
+- Fix type inference for int64/uint64 (BIGINT) and float64 (DOUBLE) (databricks/databricks-sql-go#316)
+- Fix context loss in polling and connection close operations (databricks/databricks-sql-go#295)
+- CloudFetch: allow configuration of HTTP client (databricks/databricks-sql-go#308)
+- Add metric view metadata support (databricks/databricks-sql-go#286)
+
 ## v1.9.0 (2025-09-17)
 - Added support for query tags
 - Passing session params in open session request instead of SET commands (databricks/databricks-sql-go#283)

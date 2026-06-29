@@ -16,20 +16,24 @@ import (
 	dbsqlerr "github.com/databricks/databricks-sql-go/errors"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
 	"github.com/databricks/databricks-sql-go/internal/client"
+	context2 "github.com/databricks/databricks-sql-go/internal/compat/context"
 	"github.com/databricks/databricks-sql-go/internal/config"
 	dbsqlerrint "github.com/databricks/databricks-sql-go/internal/errors"
+	"github.com/databricks/databricks-sql-go/internal/retry"
 	"github.com/databricks/databricks-sql-go/internal/rows"
 	"github.com/databricks/databricks-sql-go/internal/sentinel"
 	"github.com/databricks/databricks-sql-go/internal/thrift_protocol"
 	"github.com/databricks/databricks-sql-go/logger"
+	"github.com/databricks/databricks-sql-go/telemetry"
 	"github.com/pkg/errors"
 )
 
 type conn struct {
-	id      string
-	cfg     *config.Config
-	client  cli_service.TCLIService
-	session *cli_service.TOpenSessionResp
+	id        string
+	cfg       *config.Config
+	client    cli_service.TCLIService
+	session   *cli_service.TOpenSessionResp
+	telemetry *telemetry.Interceptor // Optional telemetry interceptor
 }
 
 // Prepare prepares a statement with the query bound to this connection.
@@ -49,13 +53,22 @@ func (c *conn) Close() error {
 	log := logger.WithContext(c.id, "", "")
 	ctx := driverctx.NewContextWithConnId(context.Background(), c.id)
 
+	// Time CloseSession so we can record DELETE_SESSION before flushing telemetry
+	closeStart := time.Now()
 	_, err := c.client.CloseSession(ctx, &cli_service.TCloseSessionReq{
 		SessionHandle: c.session.SessionHandle,
 	})
 
+	// Record DELETE_SESSION regardless of error (matches JDBC), then flush and release
+	if c.telemetry != nil {
+		c.telemetry.RecordOperation(ctx, c.id, "", telemetry.OperationTypeDeleteSession, time.Since(closeStart).Milliseconds(), err)
+		_ = c.telemetry.Close(ctx)
+		telemetry.ReleaseForConnection(c.cfg.Host)
+	}
+
 	if err != nil {
 		log.Err(err).Msg("databricks: failed to close connection")
-		return dbsqlerrint.NewRequestError(ctx, dbsqlerr.ErrCloseConnection, err)
+		return dbsqlerrint.NewBadConnectionError(err)
 	}
 	return nil
 }
@@ -84,7 +97,7 @@ func (c *conn) Ping(ctx context.Context) error {
 		log.Err(err).Msg("databricks: failed to ping")
 		return dbsqlerrint.NewBadConnectionError(err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	log.Debug().Msg("databricks: ping successful")
 	return nil
@@ -114,20 +127,53 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 	corrId := driverctx.CorrelationIdFromContext(ctx)
 
+	// Capture execution start time for telemetry before running the query
+	executeStart := time.Now()
 	exStmtResp, opStatusResp, err := c.runQuery(ctx, query, args)
 	log, ctx = client.LoggerAndContext(ctx, exStmtResp)
+
+	// Telemetry: set up metric context BEFORE staging operation so that the
+	// staging op's telemetryUpdate callback can attach tags to the metric context.
+	var statementID string
+	var closeOpErr error // Track CloseOperation errors for telemetry
+	if c.telemetry != nil && exStmtResp != nil && exStmtResp.OperationHandle != nil && exStmtResp.OperationHandle.OperationId != nil {
+		statementID = client.SprintGuid(exStmtResp.OperationHandle.OperationId.GUID)
+		ctx = c.telemetry.BeforeExecuteWithTime(ctx, c.id, statementID, executeStart)
+		c.telemetry.AddTag(ctx, telemetry.TagOperationType, telemetry.OperationTypeExecuteStatement)
+	}
+
 	stagingErr := c.execStagingOperation(exStmtResp, ctx)
+
+	if c.telemetry != nil && statementID != "" {
+		defer func() {
+			finalErr := err
+			if stagingErr != nil {
+				finalErr = stagingErr
+			}
+			// Include CloseOperation error in telemetry if it occurred
+			if closeOpErr != nil && finalErr == nil {
+				finalErr = closeOpErr
+			}
+			c.telemetry.AfterExecute(ctx, finalErr)
+			c.telemetry.CompleteStatement(ctx, statementID, finalErr != nil)
+		}()
+	}
 
 	if exStmtResp != nil && exStmtResp.OperationHandle != nil {
 		// since we have an operation handle we can close the operation if necessary
 		alreadyClosed := exStmtResp.DirectResults != nil && exStmtResp.DirectResults.CloseOperation != nil
 		newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
 		if !alreadyClosed && (opStatusResp == nil || opStatusResp.GetOperationState() != cli_service.TOperationState_CLOSED_STATE) {
+			closeOpStart := time.Now()
 			_, err1 := c.client.CloseOperation(newCtx, &cli_service.TCloseOperationReq{
 				OperationHandle: exStmtResp.OperationHandle,
 			})
+			if c.telemetry != nil {
+				c.telemetry.RecordOperation(ctx, c.id, statementID, telemetry.OperationTypeCloseStatement, time.Since(closeOpStart).Milliseconds(), err1)
+			}
 			if err1 != nil {
 				log.Err(err1).Msg("databricks: failed to close operation after executing statement")
+				closeOpErr = err1 // Capture for telemetry
 			}
 		}
 	}
@@ -139,12 +185,53 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 	if stagingErr != nil {
 		log.Err(stagingErr).Msgf("databricks: failed to execute query: query %s", query)
-		return nil, dbsqlerrint.NewExecutionError(ctx, dbsqlerr.ErrQueryExecution, err, opStatusResp)
+		return nil, dbsqlerrint.NewExecutionError(ctx, dbsqlerr.ErrQueryExecution, stagingErr, opStatusResp)
 	}
 
 	res := result{AffectedRows: opStatusResp.GetNumModifiedRows()}
 
 	return &res, nil
+}
+
+// chunkTimingAccumulator aggregates per-chunk fetch latencies for telemetry.
+// It tracks the initial, slowest, and cumulative latencies, plus the number
+// of CloudFetch file downloads. All fields should be accessed under the
+// serialization provided by database/sql's closemu (see QueryContext).
+type chunkTimingAccumulator struct {
+	initialMs  int64
+	slowestMs  int64
+	sumMs      int64
+	initialSet bool
+	// cloudFetchFileCount counts individual S3 files downloaded via CloudFetch.
+	// Used to set chunk_total_present correctly for both bulk and paginated CloudFetch:
+	//   - paginated CF (1 link/FetchResults): file count == page count == correct total
+	//   - bulk CF (all links in DirectResults): file count == actual S3 downloads
+	// For inline ArrowBatch results this stays 0 and chunk_total_present falls back to chunkCount.
+	cloudFetchFileCount int
+}
+
+// record accumulates a single chunk or download latency. Returns true if
+// the latency was positive and tags should be updated; false otherwise.
+func (a *chunkTimingAccumulator) record(latencyMs int64) bool {
+	if latencyMs <= 0 {
+		return false
+	}
+	if !a.initialSet {
+		a.initialMs = latencyMs
+		a.initialSet = true
+	}
+	if latencyMs > a.slowestMs {
+		a.slowestMs = latencyMs
+	}
+	a.sumMs += latencyMs
+	return true
+}
+
+// applyTags writes the current timing state to the telemetry context.
+func (a *chunkTimingAccumulator) applyTags(ctx context.Context, interceptor *telemetry.Interceptor) {
+	interceptor.AddTag(ctx, telemetry.TagChunkInitialLatencyMs, a.initialMs)
+	interceptor.AddTag(ctx, telemetry.TagChunkSlowestLatencyMs, a.slowestMs)
+	interceptor.AddTag(ctx, telemetry.TagChunkSumLatencyMs, a.sumMs)
 }
 
 // QueryContext executes a query that may return rows, such as a
@@ -159,18 +246,123 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 
 	// first we try to get the results synchronously.
 	// at any point in time that the context is done we must cancel and return
+
+	// Capture execution start time for telemetry before running the query
+	executeStart := time.Now()
 	exStmtResp, opStatusResp, err := c.runQuery(ctx, query, args)
 	log, ctx = client.LoggerAndContext(ctx, exStmtResp)
 	defer log.Duration(msg, start)
 
+	// Telemetry: set up metric context for the statement.
+	// BeforeExecuteWithTime anchors startTime to before runQuery() ran.
+	var statementID string
+	if c.telemetry != nil && exStmtResp != nil && exStmtResp.OperationHandle != nil && exStmtResp.OperationHandle.OperationId != nil {
+		statementID = client.SprintGuid(exStmtResp.OperationHandle.OperationId.GUID)
+		ctx = c.telemetry.BeforeExecuteWithTime(ctx, c.id, statementID, executeStart)
+		c.telemetry.AddTag(ctx, telemetry.TagOperationType, telemetry.OperationTypeExecuteStatement)
+	}
+
 	if err != nil {
+		// Error path: finalize and emit the EXECUTE_STATEMENT metric immediately —
+		// there are no rows to iterate so the metric is complete right now.
+		if c.telemetry != nil && statementID != "" {
+			c.telemetry.AfterExecute(ctx, err)
+			c.telemetry.CompleteStatement(ctx, statementID, true)
+		}
 		log.Err(err).Msg("databricks: failed to run query") // To log query we need to redact credentials
 		return nil, dbsqlerrint.NewExecutionError(ctx, dbsqlerr.ErrQueryExecution, err, opStatusResp)
 	}
 
-	corrId := driverctx.CorrelationIdFromContext(ctx)
-	rows, err := rows.NewRows(c.id, corrId, exStmtResp.OperationHandle, c.client, c.cfg, exStmtResp.DirectResults)
+	// Success path: freeze execute latency NOW (before row iteration inflates time.Since).
+	// AfterExecute/CompleteStatement are called from closeCallback after all chunks
+	// are fetched, so the final metric carries complete chunk timing data.
+	if c.telemetry != nil && statementID != "" {
+		c.telemetry.FinalizeLatency(ctx)
+	}
 
+	// chunkTimingAccumulator aggregates per-chunk fetch latencies across all
+	// fetchResultPage calls. These fields are safe without a mutex because they
+	// are only mutated from callbacks serialized by database/sql's closemu lock:
+	// telemetryUpdate and cloudFetchCallback run inside rows.Next() (which
+	// holds closemu.RLock), and closeCallback runs inside rows.Close() (which
+	// holds closemu.Lock). This ensures mutual exclusion even when Close() is
+	// called from database/sql's awaitDone goroutine on context cancellation.
+	var timing chunkTimingAccumulator
+
+	// Detach from caller's context so that telemetry tag writes and flushes
+	// survive context cancellation (e.g. query timeout, database/sql awaitDone).
+	// All three callbacks (telemetryUpdate, cloudFetchCallback, closeCallback)
+	// use this detached context uniformly.
+	telemetryCtx := context2.WithoutCancel(ctx)
+
+	// Telemetry callback invoked after each result page is fetched.
+	telemetryUpdate := func(chunkCount int, bytesDownloaded int64, chunkIndex int, chunkLatencyMs int64, _ int32) {
+		if c.telemetry == nil {
+			return
+		}
+		c.telemetry.AddTag(telemetryCtx, telemetry.TagChunkCount, chunkCount)
+		c.telemetry.AddTag(telemetryCtx, telemetry.TagBytesDownloaded, bytesDownloaded)
+
+		// Aggregate per-chunk fetch latencies (skip direct results where latency is 0).
+		if timing.record(chunkLatencyMs) {
+			timing.applyTags(telemetryCtx, c.telemetry)
+		}
+		// chunk_total_present is set definitively in closeCallback once all pages are known.
+	}
+
+	// cloudFetchCallback is invoked per S3 file download for CloudFetch result sets.
+	// It aggregates individual file download times into the same initial/slowest/sum vars
+	// used for inline chunk timing, matching JDBC's per-chunk HTTP GET timing model.
+	// For inline (non-CloudFetch) result sets this is never called.
+	var cloudFetchCallback func(downloadMs int64)
+	if c.telemetry != nil {
+		cloudFetchCallback = func(downloadMs int64) {
+			timing.cloudFetchFileCount++ // always count files for chunk_total_present, even sub-ms downloads
+			if timing.record(downloadMs) {
+				timing.applyTags(telemetryCtx, c.telemetry)
+			}
+		}
+	}
+
+	// closeCallback is invoked from rows.Close() after all rows have been consumed.
+	// At that point chunk timing is fully accumulated in telemetryCtx tags, so we
+	// finalize EXECUTE_STATEMENT here rather than at QueryContext return time.
+	var closeCallback func(latencyMs int64, chunkCount int, iterErr error, closeErr error)
+	if c.telemetry != nil && statementID != "" {
+		interceptor := c.telemetry
+		connID := c.id
+		stmtID := statementID
+		closeCallback = func(latencyMs int64, chunkCount int, iterErr error, closeErr error) {
+			// Set chunk_total_present to the definitive total now that all iteration is done.
+			// For CloudFetch, use cloudFetchFileCount (actual S3 downloads) — this handles
+			// both paginated CF (1 link/page, so file count == page count) and bulk CF
+			// (all links in DirectResults, so file count == total S3 files).
+			// For inline ArrowBatch, cloudFetchFileCount is 0; fall back to chunkCount.
+			if timing.cloudFetchFileCount > 0 {
+				interceptor.AddTag(telemetryCtx, telemetry.TagChunkTotalPresent, timing.cloudFetchFileCount)
+			} else if chunkCount > 0 {
+				interceptor.AddTag(telemetryCtx, telemetry.TagChunkTotalPresent, chunkCount)
+			}
+			// EXECUTE_STATEMENT uses the iteration error (row consumption failure)
+			// to correctly report whether the statement succeeded or failed.
+			interceptor.AfterExecute(telemetryCtx, iterErr)
+			interceptor.CompleteStatement(telemetryCtx, stmtID, iterErr != nil)
+			// CLOSE_STATEMENT uses the actual CloseOperation RPC error.
+			interceptor.RecordOperation(telemetryCtx, connID, stmtID, telemetry.OperationTypeCloseStatement, latencyMs, closeErr)
+		}
+	} else if c.telemetry != nil {
+		interceptor := c.telemetry
+		connID := c.id
+		closeCallback = func(latencyMs int64, _ int, _ error, closeErr error) {
+			interceptor.RecordOperation(telemetryCtx, connID, "", telemetry.OperationTypeCloseStatement, latencyMs, closeErr)
+		}
+	}
+
+	rows, err := rows.NewRows(ctx, exStmtResp.OperationHandle, c.client, c.cfg, exStmtResp.DirectResults, &rows.TelemetryCallbacks{
+		OnChunkFetched:   telemetryUpdate,
+		OnClose:          closeCallback,
+		OnCloudFetchFile: cloudFetchCallback,
+	})
 	return rows, err
 
 }
@@ -324,6 +516,17 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 		req.Parameters = parameters
 	}
 
+	// Add per-statement query tags if provided via context
+	if queryTags := driverctx.QueryTagsFromContext(ctx); len(queryTags) > 0 {
+		serialized := SerializeQueryTags(queryTags)
+		if serialized != "" {
+			if req.ConfOverlay == nil {
+				req.ConfOverlay = make(map[string]string)
+			}
+			req.ConfOverlay["query_tags"] = serialized
+		}
+	}
+
 	resp, err := c.client.ExecuteStatement(ctx, &req)
 	var log *logger.DBSQLLogger
 	log, ctx = client.LoggerAndContext(ctx, resp)
@@ -339,6 +542,7 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 
 	select {
 	default:
+		// Non-blocking check: continue if context not done
 	case <-ctx.Done():
 		newCtx := driverctx.NewContextFromBackground(ctx)
 		// in case context is done, we need to cancel the operation if necessary
@@ -367,7 +571,7 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 	log := logger.WithContext(c.id, corrId, client.SprintGuid(opHandle.OperationId.GUID))
 	var statusResp *cli_service.TGetOperationStatusResp
 	ctx = driverctx.NewContextWithConnId(ctx, c.id)
-	newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
+	newCtx := context2.WithoutCancel(ctx)
 	pollSentinel := sentinel.Sentinel{
 		OnDoneFn: func(statusResp any) (any, error) {
 			return statusResp, nil
@@ -444,95 +648,248 @@ var _ driver.ConnBeginTx = (*conn)(nil)
 var _ driver.NamedValueChecker = (*conn)(nil)
 
 func Succeeded(response *http.Response) bool {
-	if response.StatusCode == 200 || response.StatusCode == 201 || response.StatusCode == 202 || response.StatusCode == 204 {
-		return true
-	}
-	return false
+	return statusInSuccessRange(response.StatusCode)
+}
+
+// statusInSuccessRange returns true for the 2xx status codes the staging
+// HTTP path treats as success: 200 OK / 201 Created / 202 Accepted / 204
+// No Content. Exposed separately from Succeeded so handlers can extend the
+// accept set (e.g. REMOVE accepts 404 for idempotent-delete semantics).
+func statusInSuccessRange(status int) bool {
+	return status == 200 || status == 201 || status == 202 || status == 204
 }
 
 func (c *conn) handleStagingPut(ctx context.Context, presignedUrl string, headers map[string]string, localFile string) dbsqlerr.DBError {
 	if localFile == "" {
 		return dbsqlerrint.NewDriverError(ctx, "cannot perform PUT without specifying a local_file", nil)
 	}
-	client := &http.Client{}
 
-	dat, err := os.Open(localFile)
+	dat, err := os.Open(localFile) //nolint:gosec // localFile is provided by the application, not user input
 	if err != nil {
 		return dbsqlerrint.NewDriverError(ctx, "error reading local file", err)
 	}
-	defer dat.Close()
+	defer dat.Close() //nolint:errcheck
 
 	info, err := dat.Stat()
 	if err != nil {
 		return dbsqlerrint.NewDriverError(ctx, "error reading local file info", err)
 	}
+	size := info.Size()
 
-	req, _ := http.NewRequest("PUT", presignedUrl, dat)
-	req.ContentLength = info.Size() // backend actually requires content length to be known
-
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	// Each retry attempt needs a fresh request because http.Client.Do consumes
+	// the request body. Rewind the *os.File between attempts so the server
+	// receives the full payload on every retry, not just attempt 1.
+	//
+	// Wrap the file in io.NopCloser so http.Client.Do can't close it — by
+	// default it closes any body that implements io.Closer, which would break
+	// the Seek on the next retry. The outer defer dat.Close() above owns the
+	// file's lifecycle.
+	reqFactory := func(attempt int) (*http.Request, error) {
+		if attempt > 0 {
+			if _, seekErr := dat.Seek(0, io.SeekStart); seekErr != nil {
+				return nil, seekErr
+			}
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, presignedUrl, io.NopCloser(dat))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.ContentLength = size // backend actually requires content length to be known
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return req, nil
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		return dbsqlerrint.NewDriverError(ctx, "error sending http request", err)
-	}
-	defer res.Body.Close()
-	content, err := io.ReadAll(res.Body)
 
-	if err != nil || !Succeeded(res) {
-		return dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation over HTTP was unsuccessful: %d-%s", res.StatusCode, content), nil)
+	if _, err := c.doStagingRequestWithRetry(ctx, reqFactory); err != nil {
+		return err
 	}
 	return nil
-
 }
 
 func (c *conn) handleStagingGet(ctx context.Context, presignedUrl string, headers map[string]string, localFile string) dbsqlerr.DBError {
 	if localFile == "" {
 		return dbsqlerrint.NewDriverError(ctx, "cannot perform GET without specifying a local_file", nil)
 	}
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", presignedUrl, nil)
 
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	reqFactory := func(_ int) (*http.Request, error) {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, presignedUrl, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return req, nil
 	}
-	res, err := client.Do(req)
+
+	content, err := c.doStagingRequestWithRetry(ctx, reqFactory)
 	if err != nil {
-		return dbsqlerrint.NewDriverError(ctx, "error sending http request", err)
+		return err
 	}
-	defer res.Body.Close()
-	content, err := io.ReadAll(res.Body)
-
-	if err != nil || !Succeeded(res) {
-		return dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation over HTTP was unsuccessful: %d-%s", res.StatusCode, content), nil)
-	}
-
-	err = os.WriteFile(localFile, content, 0644) //nolint:gosec
-	if err != nil {
-		return dbsqlerrint.NewDriverError(ctx, "error writing local file", err)
+	if writeErr := os.WriteFile(localFile, content, 0644); writeErr != nil { //nolint:gosec
+		return dbsqlerrint.NewDriverError(ctx, "error writing local file", writeErr)
 	}
 	return nil
 }
 
 func (c *conn) handleStagingRemove(ctx context.Context, presignedUrl string, headers map[string]string) dbsqlerr.DBError {
-	client := &http.Client{}
-	req, _ := http.NewRequest("DELETE", presignedUrl, nil)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	res, err := client.Do(req)
-	if err != nil {
-		return dbsqlerrint.NewDriverError(ctx, "error sending http request", err)
-	}
-	defer res.Body.Close()
-	content, err := io.ReadAll(res.Body)
-
-	if err != nil || !Succeeded(res) {
-		return dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation over HTTP was unsuccessful: %d-%s, nil", res.StatusCode, content), nil)
+	reqFactory := func(_ int) (*http.Request, error) {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodDelete, presignedUrl, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return req, nil
 	}
 
+	// Treat 404 as success on REMOVE: DELETE is idempotent, and a 404 means
+	// the object is already absent — which is the post-condition the caller
+	// asked for. This also avoids spurious failures when a successful DELETE
+	// returns a transient 5xx mid-response and the retry sees 404 from the
+	// server having already applied the original request.
+	acceptStatus := func(status int) bool {
+		return statusInSuccessRange(status) || status == http.StatusNotFound
+	}
+
+	if _, err := c.doStagingRequestWithRetryAccept(ctx, reqFactory, acceptStatus); err != nil {
+		return err
+	}
 	return nil
+}
+
+// maxStagingErrorBodyBytes bounds the response body bytes included in
+// terminal staging error messages. Proxies and misconfigured backends can
+// return multi-MB error bodies; truncating keeps the driver error readable
+// without dropping the typical S3 XML error code that fits well under 512B.
+const maxStagingErrorBodyBytes = 512
+
+// doStagingRequestWithRetry executes a staging HTTP request with retry on
+// transient object-storage failures (ES-1911239). Wraps
+// doStagingRequestWithRetryAccept with the default success predicate (2xx
+// from statusInSuccessRange / Succeeded).
+func (c *conn) doStagingRequestWithRetry(ctx context.Context, reqFactory func(attempt int) (*http.Request, error)) ([]byte, dbsqlerr.DBError) {
+	return c.doStagingRequestWithRetryAccept(ctx, reqFactory, statusInSuccessRange)
+}
+
+// doStagingRequestWithRetryAccept is the generalized staging retry helper
+// used by all three handleStaging* methods. Mirrors the CloudFetch retry
+// path (ES-1892645) in semantics — same retryable status set, same
+// exponential-backoff-with-jitter schedule, same RetryMax/RetryWaitMin/
+// RetryWaitMax config knobs — so behavior is consistent across the driver's
+// two object-storage code paths.
+//
+// reqFactory must return a fresh *http.Request on each call. Attempt 0 is
+// the initial request; attempt N>0 is a retry. The PUT path uses this to
+// rewind the file body between attempts; other staging paths just construct
+// a new request each time.
+//
+// acceptStatus reports whether a given HTTP status code should be treated
+// as success. Most handlers pass statusInSuccessRange. The REMOVE handler
+// extends this to also accept 404 (idempotent-delete semantics).
+//
+// On success returns the response body bytes. On terminal failure (non-
+// retryable status, exhausted retries, or context cancellation) returns a
+// dbsqlerr.DBError describing the final state.
+func (c *conn) doStagingRequestWithRetryAccept(
+	ctx context.Context,
+	reqFactory func(attempt int) (*http.Request, error),
+	acceptStatus func(status int) bool,
+) ([]byte, dbsqlerr.DBError) {
+	retryMax := c.cfg.RetryMax
+	if retryMax < 0 {
+		retryMax = 0
+	}
+	client := &http.Client{}
+
+	var (
+		lastErr        error
+		lastStatus     int
+		lastBody       []byte
+		lastRetryAfter string
+	)
+
+	for attempt := 0; attempt <= retryMax; attempt++ {
+		if attempt > 0 {
+			wait := retry.Backoff(attempt, c.cfg.RetryWaitMin, c.cfg.RetryWaitMax, lastRetryAfter)
+			logger.Debug().Msgf(
+				"staging: retrying HTTP request (attempt %d/%d) in %v; lastStatus=%d lastErr=%v",
+				attempt, retryMax, wait, lastStatus, lastErr,
+			)
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				if !t.Stop() {
+					<-t.C
+				}
+				return nil, dbsqlerrint.NewDriverError(ctx, "staging operation cancelled during retry backoff", ctx.Err())
+			case <-t.C:
+			}
+		}
+
+		req, reqErr := reqFactory(attempt)
+		if reqErr != nil {
+			return nil, dbsqlerrint.NewDriverError(ctx, "error building staging http request", reqErr)
+		}
+
+		res, err := client.Do(req)
+		if err != nil {
+			// Caller cancellation is terminal; otherwise treat transport
+			// errors (TCP RST, TLS timeout, etc.) as transient.
+			if ctx.Err() != nil {
+				return nil, dbsqlerrint.NewDriverError(ctx, "error sending http request", ctx.Err())
+			}
+			lastErr = err
+			lastStatus = 0
+			lastRetryAfter = ""
+			continue
+		}
+
+		body, readErr := io.ReadAll(res.Body)
+		res.Body.Close() //nolint:errcheck,gosec // G104: close after drain
+
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, dbsqlerrint.NewDriverError(ctx, "error reading http response", ctx.Err())
+			}
+			lastErr = readErr
+			lastStatus = 0
+			lastRetryAfter = ""
+			continue
+		}
+
+		if acceptStatus(res.StatusCode) {
+			return body, nil
+		}
+
+		lastStatus = res.StatusCode
+		lastErr = nil
+		lastBody = body
+		lastRetryAfter = res.Header.Get("Retry-After")
+
+		if !retry.IsRetryableStatus(res.StatusCode) {
+			return nil, dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation over HTTP was unsuccessful: %d-%s", res.StatusCode, truncateErrorBody(body)), nil)
+		}
+	}
+
+	if lastStatus != 0 {
+		// lastErr is nil here by construction: the HTTP-status branch above
+		// explicitly clears it on every iteration. The status code and body
+		// are captured in msg, so there's no underlying error to wrap.
+		return nil, dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation over HTTP was unsuccessful: %d-%s (after %d retries)", lastStatus, truncateErrorBody(lastBody), retryMax), nil)
+	}
+	return nil, dbsqlerrint.NewDriverError(ctx, fmt.Sprintf("staging operation HTTP request failed: %v (after %d retries)", lastErr, retryMax), lastErr)
+}
+
+// truncateErrorBody caps b at maxStagingErrorBodyBytes for inclusion in error
+// messages, appending an indicator when truncation occurred.
+func truncateErrorBody(b []byte) string {
+	if len(b) <= maxStagingErrorBodyBytes {
+		return string(b)
+	}
+	return fmt.Sprintf("%s... (%d bytes total, truncated)", b[:maxStagingErrorBodyBytes], len(b))
 }
 
 func localPathIsAllowed(stagingAllowedLocalPaths []string, localFile string) bool {
@@ -566,7 +923,6 @@ func (c *conn) execStagingOperation(
 		return nil
 	}
 
-	corrId := driverctx.CorrelationIdFromContext(ctx)
 	var row driver.Rows
 	var err error
 
@@ -589,10 +945,20 @@ func (c *conn) execStagingOperation(
 	}
 
 	if len(driverctx.StagingPathsFromContext(ctx)) != 0 {
-		row, err = rows.NewRows(c.id, corrId, exStmtResp.OperationHandle, c.client, c.cfg, exStmtResp.DirectResults)
+		// Telemetry callback for staging operation row fetching (chunk timing not tracked for staging ops).
+		telemetryUpdate := func(chunkCount int, bytesDownloaded int64, chunkIndex int, chunkLatencyMs int64, totalChunksPresent int32) {
+			if c.telemetry != nil {
+				c.telemetry.AddTag(ctx, telemetry.TagChunkCount, chunkCount)
+				c.telemetry.AddTag(ctx, telemetry.TagBytesDownloaded, bytesDownloaded)
+			}
+		}
+		row, err = rows.NewRows(ctx, exStmtResp.OperationHandle, c.client, c.cfg, exStmtResp.DirectResults, &rows.TelemetryCallbacks{
+			OnChunkFetched: telemetryUpdate,
+		})
 		if err != nil {
 			return dbsqlerrint.NewDriverError(ctx, "error reading row.", err)
 		}
+		defer row.Close() //nolint:errcheck
 
 	} else {
 		return dbsqlerrint.NewDriverError(ctx, "staging ctx must be provided.", nil)
@@ -605,7 +971,7 @@ func (c *conn) execStagingOperation(
 	if err != nil {
 		return dbsqlerrint.NewDriverError(ctx, "error fetching staging operation results", err)
 	}
-	var stringValues []string = make([]string, 4)
+	stringValues := make([]string, 4)
 	for i, val := range sqlRow { // this will either be 3 (remove op) or 4 (put/get) elements
 		if s, ok := val.(string); ok {
 			stringValues[i] = s

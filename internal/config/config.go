@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	dbsqlerr "github.com/databricks/databricks-sql-go/errors"
@@ -21,6 +22,14 @@ import (
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
 	dbsqlerrint "github.com/databricks/databricks-sql-go/internal/errors"
 	"github.com/databricks/databricks-sql-go/logger"
+)
+
+// Each deprecated DSN telemetry param logs at most one warning per process.
+// Apps that open many connections with the same DSN should not flood the
+// log with the same deprecation notice on every parse.
+var (
+	telemetryRetryCountWarnOnce sync.Once
+	telemetryRetryDelayWarnOnce sync.Once
 )
 
 // Driver Configurations.
@@ -82,22 +91,28 @@ func (c *Config) DeepCopy() *Config {
 
 // UserConfig is the set of configurations exposed to users
 type UserConfig struct {
-	Protocol                 string
-	Host                     string // from databricks UI
-	Port                     int    // from databricks UI
-	HTTPPath                 string // from databricks UI
-	Catalog                  string
-	Schema                   string
-	Authenticator            auth.Authenticator
-	AccessToken              string        // from databricks UI
-	MaxRows                  int           // max rows per page
-	QueryTimeout             time.Duration // Timeout passed to server for query processing
-	UserAgentEntry           string
-	Location                 *time.Location
-	SessionParams            map[string]string
-	RetryWaitMin             time.Duration
-	RetryWaitMax             time.Duration
-	RetryMax                 int
+	Protocol       string
+	Host           string // from databricks UI
+	Port           int    // from databricks UI
+	HTTPPath       string // from databricks UI
+	Catalog        string
+	Schema         string
+	Authenticator  auth.Authenticator
+	AccessToken    string        // from databricks UI
+	MaxRows        int           // max rows per page
+	QueryTimeout   time.Duration // Timeout passed to server for query processing
+	UserAgentEntry string
+	Location       *time.Location
+	SessionParams  map[string]string
+	RetryWaitMin   time.Duration
+	RetryWaitMax   time.Duration
+	RetryMax       int
+	// Telemetry configuration
+	// Uses config overlay pattern: client > server > default.
+	// Unset = check server feature flag; explicitly true/false overrides the server.
+	EnableTelemetry          ConfigValue[bool]
+	TelemetryBatchSize       int           // 0 = use default (100)
+	TelemetryFlushInterval   time.Duration // 0 = use default (5s)
 	Transport                http.RoundTripper
 	UseLz4Compression        bool
 	EnableMetricViewMetadata bool
@@ -144,6 +159,9 @@ func (ucfg UserConfig) DeepCopy() UserConfig {
 		UseLz4Compression:        ucfg.UseLz4Compression,
 		EnableMetricViewMetadata: ucfg.EnableMetricViewMetadata,
 		CloudFetchConfig:         ucfg.CloudFetchConfig,
+		EnableTelemetry:          ucfg.EnableTelemetry,
+		TelemetryBatchSize:       ucfg.TelemetryBatchSize,
+		TelemetryFlushInterval:   ucfg.TelemetryFlushInterval,
 	}
 }
 
@@ -178,6 +196,9 @@ func (ucfg UserConfig) WithDefaults() UserConfig {
 	}
 	ucfg.UseLz4Compression = false
 	ucfg.CloudFetchConfig = CloudFetchConfig{}.WithDefaults()
+
+	// EnableTelemetry defaults to unset (ConfigValue zero value),
+	// meaning telemetry is controlled by server feature flags.
 
 	return ucfg
 }
@@ -280,6 +301,45 @@ func ParseDSN(dsn string) (UserConfig, error) {
 			return UserConfig{}, err
 		}
 		ucfg.EnableMetricViewMetadata = enableMetricViewMetadata
+	}
+
+	// Telemetry parameters
+	if enableTelemetry, ok, err := params.extractAsBool("enableTelemetry"); ok {
+		if err != nil {
+			return UserConfig{}, err
+		}
+		ucfg.EnableTelemetry = NewConfigValue(enableTelemetry)
+	}
+	if batchSize, ok, err := params.extractAsInt("telemetry_batch_size"); ok {
+		if err != nil {
+			return UserConfig{}, err
+		}
+		if batchSize > 0 {
+			ucfg.TelemetryBatchSize = batchSize
+		}
+	}
+	if flushInterval, ok := params.extract("telemetry_flush_interval"); ok {
+		if d, err := time.ParseDuration(flushInterval); err == nil && d > 0 {
+			ucfg.TelemetryFlushInterval = d
+		}
+	}
+	// telemetry_retry_count and telemetry_retry_delay are accepted for
+	// backwards compatibility but no longer applied — retries for
+	// telemetry traffic are owned by the underlying retryable HTTP
+	// client and the circuit breaker's open-state interval. Extract and
+	// discard the values so they don't fall through into session params
+	// below, and log a one-time-per-process warning so operators
+	// carrying legacy DSNs notice the silent change in behaviour
+	// without flooding the log on connection pools that reparse the DSN.
+	if v, ok := params.extract("telemetry_retry_count"); ok {
+		telemetryRetryCountWarnOnce.Do(func() {
+			logger.Warn().Msgf("DSN param telemetry_retry_count=%q is deprecated and ignored; telemetry retries are now managed by the HTTP client and circuit breaker", v)
+		})
+	}
+	if v, ok := params.extract("telemetry_retry_delay"); ok {
+		telemetryRetryDelayWarnOnce.Do(func() {
+			logger.Warn().Msgf("DSN param telemetry_retry_delay=%q is deprecated and ignored; telemetry retries are now managed by the HTTP client and circuit breaker", v)
+		})
 	}
 
 	// for timezone we do a case insensitive key match.

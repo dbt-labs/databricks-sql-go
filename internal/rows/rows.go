@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"io"
 	"math"
 	"reflect"
 	"time"
@@ -12,6 +13,7 @@ import (
 	dbsqlerr "github.com/databricks/databricks-sql-go/errors"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
 	dbsqlclient "github.com/databricks/databricks-sql-go/internal/client"
+	context2 "github.com/databricks/databricks-sql-go/internal/compat/context"
 	"github.com/databricks/databricks-sql-go/internal/config"
 	dbsqlerr_int "github.com/databricks/databricks-sql-go/internal/errors"
 	"github.com/databricks/databricks-sql-go/internal/rows/arrowbased"
@@ -56,7 +58,33 @@ type rows struct {
 
 	logger_ *dbsqllog.DBSQLLogger
 
+	// ctx is the context used for all server-side result RPCs (FetchResults,
+	// GetResultSetMetadata, CloseOperation) and CloudFetch downloads. It is
+	// detached from the caller's QueryContext cancellation so that a deadline
+	// gating statement submission does not truncate result streaming, while
+	// preserving context values used for auth/logging. It remains abortable via
+	// Close() through resultsCancel.
 	ctx context.Context
+	// resultsCancel aborts in-flight result RPCs/downloads when Close() is
+	// called, so the detached ctx never leaves an operation uncancellable.
+	resultsCancel context.CancelFunc
+
+	// Telemetry tracking
+	// telemetryUpdate is called after each chunk is fetched with:
+	//   chunkCount: total chunks fetched so far (including direct results)
+	//   bytesDownloaded: cumulative bytes
+	//   chunkIndex: 0-based index of the chunk just fetched
+	//   chunkLatencyMs: fetch latency for this chunk (0 for direct results or CloudFetch pages)
+	//   totalChunksPresent: server-reported total, 0 if unknown
+	telemetryUpdate func(chunkCount int, bytesDownloaded int64, chunkIndex int, chunkLatencyMs int64, totalChunksPresent int32)
+	// cloudFetchCallback is invoked per S3 file download for CloudFetch result sets.
+	// It receives the individual file download duration so that telemetry can track
+	// initial/slowest/sum download times matching JDBC's per-chunk HTTP GET timing.
+	cloudFetchCallback func(downloadMs int64)
+	closeCallback      func(latencyMs int64, chunkCount int, iterErr error, closeErr error)
+	chunkCount         int
+	bytesDownloaded    int64
+	iterationErr       error // first error from Next()/fetchResultPage, passed to closeCallback
 }
 
 var _ driver.Rows = (*rows)(nil)
@@ -66,23 +94,37 @@ var _ driver.RowsColumnTypeNullable = (*rows)(nil)
 var _ driver.RowsColumnTypeLength = (*rows)(nil)
 var _ dbsqlrows.Rows = (*rows)(nil)
 
+// TelemetryCallbacks bundles the optional telemetry hooks passed into NewRows.
+// Pass nil when telemetry is not active; individual fields may also be nil.
+type TelemetryCallbacks struct {
+	// OnChunkFetched is called after each result page fetch with chunk-level stats.
+	OnChunkFetched func(chunkCount int, bytesDownloaded int64, chunkIndex int, chunkLatencyMs int64, totalChunksPresent int32)
+	// OnClose is called from rows.Close() after all rows have been consumed.
+	// iterErr is the first error from Next()/fetchResultPage (nil if iteration succeeded).
+	// closeErr is the error from the CloseOperation RPC (nil if close succeeded).
+	OnClose func(latencyMs int64, chunkCount int, iterErr error, closeErr error)
+	// OnCloudFetchFile is called per S3 file download for CloudFetch result sets.
+	OnCloudFetchFile func(downloadMs int64)
+}
+
 func NewRows(
-	connId string,
-	correlationId string,
+	ctx context.Context,
 	opHandle *cli_service.TOperationHandle,
 	client cli_service.TCLIService,
 	config *config.Config,
 	directResults *cli_service.TSparkDirectResults,
+	callbacks *TelemetryCallbacks,
 ) (driver.Rows, dbsqlerr.DBError) {
 
+	connId := driverctx.ConnIdFromContext(ctx)
+	correlationId := driverctx.CorrelationIdFromContext(ctx)
+
 	var logger *dbsqllog.DBSQLLogger
-	var ctx context.Context
 	if opHandle != nil {
 		logger = dbsqllog.WithContext(connId, correlationId, dbsqlclient.SprintGuid(opHandle.OperationId.GUID))
-		ctx = driverctx.NewContextWithQueryId(driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), connId), correlationId), dbsqlclient.SprintGuid(opHandle.OperationId.GUID))
+		ctx = driverctx.NewContextWithQueryId(ctx, dbsqlclient.SprintGuid(opHandle.OperationId.GUID))
 	} else {
 		logger = dbsqllog.WithContext(connId, correlationId, "")
-		ctx = driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), connId), correlationId)
 	}
 
 	if client == nil {
@@ -91,7 +133,7 @@ func NewRows(
 	}
 
 	var pageSize int64 = 10000
-	var location *time.Location = time.UTC
+	location := time.UTC
 	if config != nil {
 		pageSize = int64(config.MaxRows)
 
@@ -102,15 +144,32 @@ func NewRows(
 
 	logger.Debug().Msgf("databricks: creating Rows, pageSize: %d, location: %v", pageSize, location)
 
+	// QueryContext may use a short deadline to gate statement submission and
+	// status polling (see ES-1934053 / #295 / #371). Result handles can outlive
+	// that phase, especially for paginated CloudFetch streams, so detach
+	// server-side result RPCs from the caller's cancellation while preserving
+	// context values used for auth/logging. The detached context is still wired
+	// to a cancel func invoked from Close(), so the result handle remains
+	// abortable (no uncancellable in-flight FetchResults or CloudFetch download).
+	resultsCtx, resultsCancel := context.WithCancel(context2.WithoutCancel(ctx))
+
 	r := &rows{
-		client:        client,
-		opHandle:      opHandle,
-		connId:        connId,
-		correlationId: correlationId,
-		location:      location,
-		config:        config,
-		logger_:       logger,
-		ctx:           ctx,
+		client:          client,
+		opHandle:        opHandle,
+		connId:          connId,
+		correlationId:   correlationId,
+		location:        location,
+		config:          config,
+		logger_:         logger,
+		ctx:             resultsCtx,
+		resultsCancel:   resultsCancel,
+		chunkCount:      0,
+		bytesDownloaded: 0,
+	}
+	if callbacks != nil {
+		r.telemetryUpdate = callbacks.OnChunkFetched
+		r.cloudFetchCallback = callbacks.OnCloudFetchFile
+		r.closeCallback = callbacks.OnClose
 	}
 
 	// if we already have results for the query do some additional initialization
@@ -127,6 +186,28 @@ func NewRows(
 		if err != nil {
 			return r, err
 		}
+
+		r.chunkCount++
+		if directResults.ResultSet != nil && directResults.ResultSet.Results != nil && directResults.ResultSet.Results.ArrowBatches != nil {
+			for _, batch := range directResults.ResultSet.Results.ArrowBatches {
+				r.bytesDownloaded += int64(len(batch.Batch))
+			}
+		}
+
+		if r.telemetryUpdate != nil {
+			// Determine totalChunksPresent for direct results.
+			// If the server already closed the operation, all data is here (totalPresent=1).
+			// For CloudFetch direct results, use the number of result links.
+			var totalPresent int32
+			if directResults.CloseOperation != nil {
+				totalPresent = int32(r.chunkCount)
+			} else if directResults.ResultSet != nil && directResults.ResultSet.Results != nil &&
+				directResults.ResultSet.Results.ResultLinks != nil {
+				totalPresent = int32(len(directResults.ResultSet.Results.ResultLinks)) //nolint:gosec
+			}
+			// chunkIndex=0, chunkLatencyMs=0: direct results have no separate fetch latency.
+			r.telemetryUpdate(r.chunkCount, r.bytesDownloaded, 0, 0, totalPresent)
+		}
 	}
 
 	var d rowscanner.Delimiter
@@ -140,13 +221,12 @@ func NewRows(
 	// the operations.
 	closedOnServer := directResults != nil && directResults.CloseOperation != nil
 	r.ResultPageIterator = rowscanner.NewResultPageIterator(
+		resultsCtx,
 		d,
 		pageSize,
 		opHandle,
 		closedOnServer,
 		client,
-		connId,
-		correlationId,
 		r.logger(),
 	)
 
@@ -184,6 +264,12 @@ func (r *rows) Close() error {
 		return nil
 	}
 
+	// Release the detached results context after the close RPC runs, aborting
+	// any in-flight FetchResults/CloudFetch downloads still referencing it.
+	if r.resultsCancel != nil {
+		defer r.resultsCancel()
+	}
+
 	if r.RowScanner != nil {
 		// make sure the row scanner frees up any resources
 		r.RowScanner.Close()
@@ -191,7 +277,11 @@ func (r *rows) Close() error {
 
 	if r.ResultPageIterator != nil {
 		r.logger().Debug().Msgf("databricks: closing Rows operation")
+		closeStart := time.Now()
 		err := r.ResultPageIterator.Close()
+		if r.closeCallback != nil {
+			r.closeCallback(time.Since(closeStart).Milliseconds(), r.chunkCount, r.iterationErr, err)
+		}
 		if err != nil {
 			r.logger().Err(err).Msg(errRowsCloseFailed)
 			return dbsqlerr_int.NewRequestError(r.ctx, errRowsCloseFailed, err)
@@ -213,6 +303,7 @@ func (r *rows) Close() error {
 func (r *rows) Next(dest []driver.Value) error {
 	err := isValidRows(r)
 	if err != nil {
+		r.trackIterationErr(err)
 		return err
 	}
 
@@ -223,17 +314,20 @@ func (r *rows) Next(dest []driver.Value) error {
 	if b, e = r.isNextRowInPage(); !b && e == nil {
 		err := r.fetchResultPage()
 		if err != nil {
+			r.trackIterationErr(err)
 			return err
 		}
 	}
 
 	if e != nil {
+		r.trackIterationErr(e)
 		return e
 	}
 
 	// Put values into the destination slice
 	err = r.ScanRow(dest, r.nextRowNumber)
 	if err != nil {
+		r.trackIterationErr(err)
 		return err
 	}
 
@@ -417,9 +511,8 @@ func (r *rows) getResultSetSchema() (*cli_service.TTableSchema, dbsqlerr.DBError
 		req := cli_service.TGetResultSetMetadataReq{
 			OperationHandle: r.opHandle,
 		}
-		ctx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), r.connId), r.correlationId)
 
-		resp, err2 := r.client.GetResultSetMetadata(ctx, &req)
+		resp, err2 := r.client.GetResultSetMetadata(r.ctx, &req)
 		if err2 != nil {
 			r.logger().Err(err2).Msg(err2.Error())
 			return nil, dbsqlerr_int.NewRequestError(r.ctx, errRowsMetadataFetchFailed, err)
@@ -435,7 +528,7 @@ func (r *rows) getResultSetSchema() (*cli_service.TTableSchema, dbsqlerr.DBError
 
 // fetchResultPage will fetch the result page containing the next row, if necessary
 func (r *rows) fetchResultPage() error {
-	var err dbsqlerr.DBError = isValidRows(r)
+	err := isValidRows(r)
 	if err != nil {
 		return err
 	}
@@ -455,9 +548,41 @@ func (r *rows) fetchResultPage() error {
 		r.RowScanner = nil
 	}
 
+	// Record 0-based chunk index before fetching (direct results occupied index 0 if present).
+	chunkIndex := r.chunkCount
+	fetchStart := time.Now()
 	fetchResult, err1 := r.ResultPageIterator.Next()
+	chunkLatencyMs := time.Since(fetchStart).Milliseconds()
 	if err1 != nil {
 		return err1
+	}
+
+	r.chunkCount++
+	if fetchResult != nil && fetchResult.Results != nil {
+		if fetchResult.Results.ArrowBatches != nil {
+			for _, batch := range fetchResult.Results.ArrowBatches {
+				r.bytesDownloaded += int64(len(batch.Batch))
+			}
+		}
+	}
+
+	// For CloudFetch, the FetchResults RPC only returns presigned S3 URLs — the actual data
+	// transfer happens later via S3 HTTP GETs timed by cloudFetchCallback. Report 0 latency
+	// here so the Thrift round-trip is not misreported as chunk download time.
+	var totalPresent int32
+	isCloudFetch := false
+	if fetchResult != nil && fetchResult.Results != nil && fetchResult.Results.ResultLinks != nil {
+		totalPresent = int32(len(fetchResult.Results.ResultLinks)) //nolint:gosec
+		isCloudFetch = true
+	}
+
+	effectiveLatencyMs := chunkLatencyMs
+	if isCloudFetch {
+		effectiveLatencyMs = 0
+	}
+
+	if r.telemetryUpdate != nil {
+		r.telemetryUpdate(r.chunkCount, r.bytesDownloaded, chunkIndex, effectiveLatencyMs, totalPresent)
 	}
 
 	err1 = r.makeRowScanner(fetchResult)
@@ -494,9 +619,9 @@ func (r *rows) makeRowScanner(fetchResults *cli_service.TFetchResultsResp) dbsql
 		if fetchResults.Results.Columns != nil {
 			rs, err = columnbased.NewColumnRowScanner(schema, fetchResults.Results, r.config, r.logger(), r.ctx)
 		} else if fetchResults.Results.ArrowBatches != nil {
-			rs, err = arrowbased.NewArrowRowScanner(r.resultSetMetadata, fetchResults.Results, r.config, r.logger(), r.ctx)
+			rs, err = arrowbased.NewArrowRowScanner(r.resultSetMetadata, fetchResults.Results, r.config, r.logger(), r.ctx, nil)
 		} else if fetchResults.Results.ResultLinks != nil {
-			rs, err = arrowbased.NewArrowRowScanner(r.resultSetMetadata, fetchResults.Results, r.config, r.logger(), r.ctx)
+			rs, err = arrowbased.NewArrowRowScanner(r.resultSetMetadata, fetchResults.Results, r.config, r.logger(), r.ctx, r.cloudFetchCallback)
 		} else {
 			r.logger().Error().Msg(errRowsUnknowRowType)
 			err = dbsqlerr_int.NewDriverError(r.ctx, errRowsUnknowRowType, nil)
@@ -516,6 +641,14 @@ func (r *rows) makeRowScanner(fetchResults *cli_service.TFetchResultsResp) dbsql
 	return err
 }
 
+// trackIterationErr records the first non-EOF error from Next()/fetchResultPage
+// so that closeCallback can report it as the statement's error.
+func (r *rows) trackIterationErr(err error) {
+	if r != nil && r.iterationErr == nil && err != nil && err != io.EOF {
+		r.iterationErr = err
+	}
+}
+
 func (r *rows) logger() *dbsqllog.DBSQLLogger {
 	if r.logger_ == nil {
 		if r.opHandle != nil {
@@ -528,27 +661,34 @@ func (r *rows) logger() *dbsqllog.DBSQLLogger {
 }
 
 func (r *rows) GetArrowBatches(ctx context.Context) (dbsqlrows.ArrowBatchIterator, error) {
-	// update context with correlationId and connectionId which will be used in logging and errors
-	ctx = driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(ctx, r.connId), r.correlationId)
+	// Result fetching must outlive the caller's QueryContext deadline: both the
+	// inter-page FetchResults RPCs (via r.ResultPageIterator) AND the CloudFetch
+	// S3 downloads created from the iterator context. Build the iterator from the
+	// detached results context (abortable via Close) rather than the caller ctx,
+	// so passing a deadline-bound ctx here cannot truncate the stream. Driver
+	// values for logging/auth are already carried by r.ctx; re-apply the ids
+	// defensively. See ES-1934053 / #371.
+	iterCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(r.ctx, r.connId), r.correlationId)
 
 	// If a row scanner exists we use it to create the iterator, that way the iterator includes
 	// data returned as direct results
 	if r.RowScanner != nil {
-		return r.RowScanner.GetArrowBatches(ctx, *r.config, r.ResultPageIterator)
+		return r.RowScanner.GetArrowBatches(iterCtx, *r.config, r.ResultPageIterator)
 	}
 
-	return arrowbased.NewArrowRecordIterator(ctx, r.ResultPageIterator, nil, nil, *r.config), nil
+	return arrowbased.NewArrowRecordIterator(iterCtx, r.ResultPageIterator, nil, nil, *r.config), nil
 }
 
 func (r *rows) GetArrowIPCStreams(ctx context.Context) (dbsqlrows.ArrowIPCStreamIterator, error) {
-	// update context with correlationId and connectionId which will be used in logging and errors
-	ctx = driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(ctx, r.connId), r.correlationId)
+	// See GetArrowBatches: result fetching is detached from the caller ctx so a
+	// submit-gating deadline cannot truncate streaming; it stays abortable via Close.
+	iterCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(r.ctx, r.connId), r.correlationId)
 
 	// If a row scanner exists we use it to create the iterator, that way the iterator includes
 	// data returned as direct results
 	if r.RowScanner != nil {
-		return r.RowScanner.GetArrowIPCStreams(ctx, *r.config, r.ResultPageIterator)
+		return r.RowScanner.GetArrowIPCStreams(iterCtx, *r.config, r.ResultPageIterator)
 	}
 
-	return arrowbased.NewArrowIPCStreamIterator(ctx, r.ResultPageIterator, nil, nil, *r.config), nil
+	return arrowbased.NewArrowIPCStreamIterator(iterCtx, r.ResultPageIterator, nil, nil, *r.config), nil
 }

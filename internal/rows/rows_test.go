@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/databricks/databricks-sql-go/driverctx"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
 	"github.com/databricks/databricks-sql-go/internal/client"
 	"github.com/databricks/databricks-sql-go/internal/config"
@@ -217,14 +218,16 @@ func TestRowsFetchResultPageNoDirectResults(t *testing.T) {
 	client := getRowsTestSimpleClient(&getMetadataCount, &fetchResultsCount)
 	rowSet := &rows{client: client}
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 	resultPageIterator := rowscanner.NewResultPageIterator(
+		ctx,
 		rowscanner.NewDelimiter(0, 0),
 		1000,
 		nil,
 		false,
 		client,
-		"connId",
-		"corrId",
 		rowSet.logger(),
 	)
 	rowSet.ResultPageIterator = resultPageIterator
@@ -311,14 +314,16 @@ func TestRowsFetchResultPageWithDirectResults(t *testing.T) {
 	err1 := rowSet.makeRowScanner(firstPage)
 	assert.Nil(t, err1)
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 	resultPageIterator := rowscanner.NewResultPageIterator(
+		ctx,
 		rowscanner.NewDelimiter(rowSet.RowScanner.Start(), rowSet.RowScanner.Count()),
 		1000,
 		nil,
 		false,
 		client,
-		"connId",
-		"corrId",
 		rowSet.logger(),
 	)
 	rowSet.ResultPageIterator = resultPageIterator
@@ -413,11 +418,14 @@ func TestColumnsWithDirectResults(t *testing.T) {
 
 	client := getRowsTestSimpleClient(&getMetadataCount, &fetchResultsCount)
 
-	d, err := NewRows("", "", nil, client, nil, nil)
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
+	d, err := NewRows(ctx, nil, client, nil, nil, nil)
 	assert.Nil(t, err)
 
 	rowSet := d.(*rows)
-	defer rowSet.Close()
+	defer rowSet.Close() //nolint:errcheck
 
 	req2 := &cli_service.TGetResultSetMetadataReq{}
 	metadata, _ := client.GetResultSetMetadata(context.Background(), req2)
@@ -460,14 +468,16 @@ func TestNextNoDirectResults(t *testing.T) {
 	client := getRowsTestSimpleClient(&getMetadataCount, &fetchResultsCount)
 	rowSet.client = client
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 	resultPageIterator := rowscanner.NewResultPageIterator(
+		ctx,
 		rowscanner.NewDelimiter(0, 0),
 		1000,
 		nil,
 		false,
 		client,
-		"connId",
-		"corrId",
 		rowSet.logger(),
 	)
 	rowSet.ResultPageIterator = resultPageIterator
@@ -707,8 +717,10 @@ func TestRowsCloseOptimization(t *testing.T) {
 		},
 	}
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
 	opHandle := &cli_service.TOperationHandle{OperationId: &cli_service.THandleIdentifier{GUID: []byte{'f', 'o'}}}
-	rowSet, _ := NewRows("", "", opHandle, client, nil, nil)
+	rowSet, _ := NewRows(ctx, opHandle, client, nil, nil, nil)
 
 	// rowSet has no direct results calling Close should result in call to client to close operation
 	err := rowSet.Close()
@@ -721,7 +733,7 @@ func TestRowsCloseOptimization(t *testing.T) {
 		ResultSet:         &cli_service.TFetchResultsResp{Results: &cli_service.TRowSet{Columns: []*cli_service.TColumn{}}},
 	}
 	closeCount = 0
-	rowSet, _ = NewRows("", "", opHandle, client, nil, directResults)
+	rowSet, _ = NewRows(ctx, opHandle, client, nil, directResults, nil)
 	err = rowSet.Close()
 	assert.Nil(t, err, "rows.Close should not throw an error")
 	assert.Equal(t, 1, closeCount)
@@ -734,7 +746,7 @@ func TestRowsCloseOptimization(t *testing.T) {
 		ResultSetMetadata: &cli_service.TGetResultSetMetadataResp{Schema: &cli_service.TTableSchema{}},
 		ResultSet:         &cli_service.TFetchResultsResp{Results: &cli_service.TRowSet{Columns: []*cli_service.TColumn{}}},
 	}
-	rowSet, _ = NewRows("", "", opHandle, client, nil, directResults)
+	rowSet, _ = NewRows(ctx, opHandle, client, nil, directResults, nil)
 	err = rowSet.Close()
 	assert.Nil(t, err, "rows.Close should not throw an error")
 	assert.Equal(t, 0, closeCount)
@@ -752,17 +764,19 @@ func TestFetchResultsWithRetries(t *testing.T) {
 	// across multiple result pages.
 	fetches := []fetch{}
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 	client := getRowsTestSimpleClient2(&fetches)
 	rowSet := &rows{client: client}
 
 	resultPageIterator := rowscanner.NewResultPageIterator(
+		ctx,
 		rowscanner.NewDelimiter(0, 0),
 		1000,
 		nil,
 		false,
 		client,
-		"connId",
-		"corrId",
 		rowSet.logger(),
 	)
 	rowSet.ResultPageIterator = resultPageIterator
@@ -797,9 +811,12 @@ func TestGetArrowBatches(t *testing.T) {
 		fetchResp2 := cli_service.TFetchResultsResp{}
 		loadTestData(t, "directResultsMultipleFetch/FetchResults2.json", &fetchResp2)
 
+		ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+		ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 		client := getSimpleClient([]cli_service.TFetchResultsResp{fetchResp1, fetchResp2})
 		cfg := config.WithDefaults()
-		rows, err := NewRows("connId", "corrId", nil, client, cfg, executeStatementResp.DirectResults)
+		rows, err := NewRows(ctx, nil, client, cfg, executeStatementResp.DirectResults, nil)
 		assert.Nil(t, err)
 
 		rows2, ok := rows.(dbsqlrows.Rows)
@@ -867,9 +884,12 @@ func TestGetArrowBatches(t *testing.T) {
 		fetchResp3 := cli_service.TFetchResultsResp{}
 		loadTestData(t, "multipleFetch/FetchResults3.json", &fetchResp3)
 
+		ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+		ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 		client := getSimpleClient([]cli_service.TFetchResultsResp{fetchResp1, fetchResp2, fetchResp3})
 		cfg := config.WithDefaults()
-		rows, err := NewRows("connId", "corrId", nil, client, cfg, nil)
+		rows, err := NewRows(ctx, nil, client, cfg, nil, nil)
 		assert.Nil(t, err)
 
 		rows2, ok := rows.(dbsqlrows.Rows)
@@ -925,9 +945,12 @@ func TestGetArrowBatches(t *testing.T) {
 		fetchResp1 := cli_service.TFetchResultsResp{}
 		loadTestData(t, "zeroRows/zeroRowsFetchResult.json", &fetchResp1)
 
+		ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+		ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 		client := getSimpleClient([]cli_service.TFetchResultsResp{fetchResp1})
 		cfg := config.WithDefaults()
-		rows, err := NewRows("connId", "corrId", nil, client, cfg, nil)
+		rows, err := NewRows(ctx, nil, client, cfg, nil, nil)
 		assert.Nil(t, err)
 
 		rows2, ok := rows.(dbsqlrows.Rows)
@@ -949,9 +972,12 @@ func TestGetArrowBatches(t *testing.T) {
 		loadTestData(t, "zeroRows/zeroRowsDirectResults.json", &executeStatementResp)
 		executeStatementResp.DirectResults.ResultSet.Results.ArrowBatches = []*cli_service.TSparkArrowBatch{}
 
+		ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+		ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 		client := getSimpleClient([]cli_service.TFetchResultsResp{})
 		cfg := config.WithDefaults()
-		rows, err := NewRows("connId", "corrId", nil, client, cfg, executeStatementResp.DirectResults)
+		rows, err := NewRows(ctx, nil, client, cfg, executeStatementResp.DirectResults, nil)
 		assert.Nil(t, err)
 
 		rows2, ok := rows.(dbsqlrows.Rows)
@@ -1355,17 +1381,18 @@ func getRowsTestSimpleClient(getMetadataCount, fetchResultsCount *int) cli_servi
 
 	fetchResults := func(ctx context.Context, req *cli_service.TFetchResultsReq) (_r *cli_service.TFetchResultsResp, _err error) {
 		*fetchResultsCount++
-		if req.Orientation == cli_service.TFetchOrientation_FETCH_NEXT {
+		switch req.Orientation {
+		case cli_service.TFetchOrientation_FETCH_NEXT:
 			if pageIndex+1 >= len(pages) {
 				return nil, errors.New("can't fetch past end of result set")
 			}
 			pageIndex++
-		} else if req.Orientation == cli_service.TFetchOrientation_FETCH_PRIOR {
+		case cli_service.TFetchOrientation_FETCH_PRIOR:
 			if pageIndex-1 < 0 {
 				return nil, errors.New("can't fetch prior to start of result set")
 			}
 			pageIndex--
-		} else {
+		default:
 			return nil, errors.New("invalid fetch results orientation")
 		}
 
@@ -1525,11 +1552,269 @@ func TestFetchResultPage_PropagatesGetNextPageError(t *testing.T) {
 
 	client := getErroringClient(expectedErr)
 
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	ctx = driverctx.NewContextWithCorrelationId(ctx, "corrId")
+
 	executeStatementResp := cli_service.TExecuteStatementResp{}
 	cfg := config.WithDefaults()
-	rows, _ := NewRows("connId", "corrId", nil, client, cfg, executeStatementResp.DirectResults)
+	rows, _ := NewRows(ctx, nil, client, cfg, executeStatementResp.DirectResults, nil)
 	// Call Next and ensure it propagates the error from getNextPage
 	actualErr := rows.Next(nil)
 
 	assert.ErrorContains(t, actualErr, errorMsg)
+}
+
+func TestNewRows_DetachesResultRPCContextFromQueryContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	baseCtx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	baseCtx = driverctx.NewContextWithCorrelationId(baseCtx, "corrId")
+	queryCtx, cancel := context.WithCancel(baseCtx)
+	cancel()
+
+	assertResultCtx := func(ctx context.Context) {
+		assert.NoError(t, ctx.Err(), "result RPC context should not inherit query cancellation")
+		assert.Equal(t, "connId", driverctx.ConnIdFromContext(ctx))
+		assert.Equal(t, "corrId", driverctx.CorrelationIdFromContext(ctx))
+	}
+
+	metaCalled := false
+	metaFn := func(ctx context.Context, req *cli_service.TGetResultSetMetadataReq) (*cli_service.TGetResultSetMetadataResp, error) {
+		metaCalled = true
+		assertResultCtx(ctx)
+		return &cli_service.TGetResultSetMetadataResp{
+			Status: &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			Schema: &cli_service.TTableSchema{
+				Columns: []*cli_service.TColumnDesc{
+					{ColumnName: "flag", Position: 0, TypeDesc: &cli_service.TTypeDesc{
+						Types: []*cli_service.TTypeEntry{{
+							PrimitiveEntry: &cli_service.TPrimitiveTypeEntry{Type: cli_service.TTypeId_BOOLEAN_TYPE},
+						}},
+					}},
+				},
+			},
+		}, nil
+	}
+
+	noMoreRows := false
+	fetchCalled := false
+	fetchFn := func(ctx context.Context, req *cli_service.TFetchResultsReq) (*cli_service.TFetchResultsResp, error) {
+		fetchCalled = true
+		assertResultCtx(ctx)
+		return &cli_service.TFetchResultsResp{
+			Status:      &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			HasMoreRows: &noMoreRows,
+			Results: &cli_service.TRowSet{
+				StartRowOffset: 0,
+				Columns: []*cli_service.TColumn{
+					{BoolVal: &cli_service.TBoolColumn{Values: []bool{true}}},
+				},
+			},
+		}, nil
+	}
+
+	closeCalled := false
+	closeFn := func(ctx context.Context, req *cli_service.TCloseOperationReq) (*cli_service.TCloseOperationResp, error) {
+		closeCalled = true
+		assertResultCtx(ctx)
+		return &cli_service.TCloseOperationResp{
+			Status: &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+		}, nil
+	}
+
+	testClient := &client.TestClient{
+		FnFetchResults:         fetchFn,
+		FnGetResultSetMetadata: metaFn,
+		FnCloseOperation:       closeFn,
+	}
+	opHandle := &cli_service.TOperationHandle{
+		OperationId: &cli_service.THandleIdentifier{GUID: []byte("operation-id")},
+	}
+	cfg := config.WithDefaults()
+
+	dr, dbErr := NewRows(queryCtx, opHandle, testClient, cfg, nil, nil)
+	assert.Nil(t, dbErr)
+
+	dest := make([]driver.Value, 1)
+	assert.NoError(t, dr.Next(dest))
+	assert.Equal(t, true, dest[0])
+	assert.True(t, fetchCalled, "FetchResults should use the detached result context")
+	assert.True(t, metaCalled, "GetResultSetMetadata should use the detached result context")
+	assert.True(t, closeCalled, "CloseOperation should use the detached result context")
+}
+
+// TestNewRows_CloseAbortsDetachedResultContext verifies the detachment is not
+// total: the result context survives the caller's QueryContext cancellation
+// (so streaming is not truncated) but is still cancelled by Close(), so an
+// in-flight FetchResults/CloudFetch download can never be left uncancellable.
+func TestNewRows_CloseAbortsDetachedResultContext(t *testing.T) {
+	t.Parallel()
+
+	queryCtx, cancel := context.WithCancel(context.Background())
+
+	var capturedCtx context.Context
+	noMoreRows := false
+	fetchFn := func(ctx context.Context, req *cli_service.TFetchResultsReq) (*cli_service.TFetchResultsResp, error) {
+		capturedCtx = ctx
+		return &cli_service.TFetchResultsResp{
+			Status:      &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			HasMoreRows: &noMoreRows,
+			Results: &cli_service.TRowSet{
+				StartRowOffset: 0,
+				Columns:        []*cli_service.TColumn{{BoolVal: &cli_service.TBoolColumn{Values: []bool{true}}}},
+			},
+		}, nil
+	}
+	metaFn := func(ctx context.Context, req *cli_service.TGetResultSetMetadataReq) (*cli_service.TGetResultSetMetadataResp, error) {
+		return &cli_service.TGetResultSetMetadataResp{
+			Status: &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			Schema: &cli_service.TTableSchema{Columns: []*cli_service.TColumnDesc{
+				{ColumnName: "flag", Position: 0, TypeDesc: &cli_service.TTypeDesc{Types: []*cli_service.TTypeEntry{{
+					PrimitiveEntry: &cli_service.TPrimitiveTypeEntry{Type: cli_service.TTypeId_BOOLEAN_TYPE},
+				}}}},
+			}},
+		}, nil
+	}
+	closeFn := func(ctx context.Context, req *cli_service.TCloseOperationReq) (*cli_service.TCloseOperationResp, error) {
+		// The close RPC itself must still run with a live (un-cancelled) context.
+		assert.NoError(t, ctx.Err(), "CloseOperation must run before the result context is cancelled")
+		return &cli_service.TCloseOperationResp{Status: &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS}}, nil
+	}
+
+	testClient := &client.TestClient{FnFetchResults: fetchFn, FnGetResultSetMetadata: metaFn, FnCloseOperation: closeFn}
+	opHandle := &cli_service.TOperationHandle{OperationId: &cli_service.THandleIdentifier{GUID: []byte("operation-id")}}
+
+	dr, dbErr := NewRows(queryCtx, opHandle, testClient, config.WithDefaults(), nil, nil)
+	assert.Nil(t, dbErr)
+
+	dest := make([]driver.Value, 1)
+	assert.NoError(t, dr.Next(dest))
+	assert.NotNil(t, capturedCtx)
+
+	// Caller cancels the QueryContext: result context must remain alive.
+	cancel()
+	assert.NoError(t, capturedCtx.Err(), "result context must survive QueryContext cancellation")
+	assert.NotNil(t, capturedCtx.Done(), "result context must be abortable (non-nil Done)")
+
+	// Close() must cancel the detached result context so nothing is left uncancellable.
+	assert.NoError(t, dr.Close())
+	assert.ErrorIs(t, capturedCtx.Err(), context.Canceled, "Close() should cancel the detached result context")
+}
+
+// TestRows_CloseCallback_ReceivesChunkCount verifies that when rows.Close() is called,
+// the closeCallback receives the correct chunkCount reflecting the number of result pages
+// that were fetched during iteration.
+//
+// This covers the fix where total_chunks_present in the telemetry payload was always null
+// for paginated CloudFetch queries: the driver now derives it from r.chunkCount and passes
+// it through closeCallback so connection.go can set the "chunk_total_present" tag.
+func TestRows_CloseCallback_ReceivesChunkCount(t *testing.T) {
+	t.Parallel()
+
+	noMoreRows := false
+	moreRows := true
+
+	// Two pages: page 0 (5 rows, has more), page 1 (3 rows, no more).
+	colVals := []*cli_service.TColumn{
+		{BoolVal: &cli_service.TBoolColumn{Values: []bool{true, false, true, false, true}}},
+	}
+	colVals2 := []*cli_service.TColumn{
+		{BoolVal: &cli_service.TBoolColumn{Values: []bool{true, false, true}}},
+	}
+
+	pages := []cli_service.TFetchResultsResp{
+		{
+			Status:      &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			HasMoreRows: &moreRows,
+			Results:     &cli_service.TRowSet{StartRowOffset: 0, Columns: colVals},
+		},
+		{
+			Status:      &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			HasMoreRows: &noMoreRows,
+			Results:     &cli_service.TRowSet{StartRowOffset: 5, Columns: colVals2},
+		},
+	}
+
+	pageIndex := -1
+	fetchFn := func(ctx context.Context, req *cli_service.TFetchResultsReq) (*cli_service.TFetchResultsResp, error) {
+		pageIndex++
+		p := pages[pageIndex]
+		return &p, nil
+	}
+	metaFn := func(ctx context.Context, req *cli_service.TGetResultSetMetadataReq) (*cli_service.TGetResultSetMetadataResp, error) {
+		return &cli_service.TGetResultSetMetadataResp{
+			Status: &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			Schema: &cli_service.TTableSchema{
+				Columns: []*cli_service.TColumnDesc{
+					{ColumnName: "flag", Position: 0, TypeDesc: &cli_service.TTypeDesc{
+						Types: []*cli_service.TTypeEntry{{
+							PrimitiveEntry: &cli_service.TPrimitiveTypeEntry{Type: cli_service.TTypeId_BOOLEAN_TYPE},
+						}},
+					}},
+				},
+			},
+		}, nil
+	}
+
+	testClient := &client.TestClient{
+		FnFetchResults:         fetchFn,
+		FnGetResultSetMetadata: metaFn,
+	}
+
+	var callbackChunkCount int
+	closeCallback := func(latencyMs int64, chunkCount int, iterErr error, closeErr error) {
+		callbackChunkCount = chunkCount
+	}
+
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	cfg := config.WithDefaults()
+	cfg.MaxRows = 5 // force paging
+
+	dr, dbErr := NewRows(ctx, nil, testClient, cfg, nil, &TelemetryCallbacks{OnClose: closeCallback})
+	assert.Nil(t, dbErr)
+
+	// Drain all rows to force two FetchResults calls.
+	dest := make([]driver.Value, 1)
+	for dr.Next(dest) == nil {
+	}
+
+	// Close should invoke the callback with the total chunk count (2 pages fetched).
+	assert.Nil(t, dr.Close())
+
+	// direct results count as chunk 0; two FetchResults calls give chunkCount=2.
+	// (No directResults here so chunkCount starts at 0, then +1 per FetchResults call.)
+	assert.Equal(t, 2, callbackChunkCount,
+		"closeCallback must receive the total number of result pages fetched")
+}
+
+// TestRows_CloseCallback_NilDoesNotPanic verifies that passing nil for closeCallback
+// does not cause a panic when rows.Close() is called.
+func TestRows_CloseCallback_NilDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	noMoreRows := false
+	pages := []cli_service.TFetchResultsResp{
+		{
+			Status:      &cli_service.TStatus{StatusCode: cli_service.TStatusCode_SUCCESS_STATUS},
+			HasMoreRows: &noMoreRows,
+			Results:     &cli_service.TRowSet{StartRowOffset: 0, Columns: []*cli_service.TColumn{}},
+		},
+	}
+	pageIndex := -1
+	fetchFn := func(ctx context.Context, req *cli_service.TFetchResultsReq) (*cli_service.TFetchResultsResp, error) {
+		pageIndex++
+		p := pages[pageIndex]
+		return &p, nil
+	}
+	testClient := &client.TestClient{FnFetchResults: fetchFn}
+
+	ctx := driverctx.NewContextWithConnId(context.Background(), "connId")
+	cfg := config.WithDefaults()
+
+	dr, dbErr := NewRows(ctx, nil, testClient, cfg, nil, nil)
+	assert.Nil(t, dbErr)
+
+	assert.NotPanics(t, func() {
+		_ = dr.Close()
+	}, "nil closeCallback must not cause a panic on rows.Close()")
 }
