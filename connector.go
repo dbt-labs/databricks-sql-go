@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -53,7 +54,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 
 	protocolVersion := int64(c.cfg.ThriftProtocolVersion)
-	session, err := tclient.OpenSession(ctx, &cli_service.TOpenSessionReq{
+	openReq := &cli_service.TOpenSessionReq{
 		ClientProtocolI64: &protocolVersion,
 		Configuration:     sessionParams,
 		InitialNamespace: &cli_service.TNamespace{
@@ -61,9 +62,57 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 			SchemaName:  schemaName,
 		},
 		CanUseMultipleCatalogs: &c.cfg.CanUseMultipleCatalogs,
-	})
-	if err != nil {
-		return nil, dbsqlerrint.NewRequestError(ctx, fmt.Sprintf("error connecting: host=%s port=%d, httpPath=%s", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath), err)
+	}
+
+	// When ConnectTimeout is configured, bound the whole session-open by that
+	// deadline and keep retrying while the warehouse is unavailable (e.g. a
+	// cold-starting cluster returning HTTP 503), so a slow cold start succeeds
+	// instead of failing once the per-request retry budget (RetryMax) is
+	// exhausted. These connect retries are independent of the query-level
+	// RetryMax and stop as soon as the deadline elapses. When ConnectTimeout is
+	// unset (<= 0) this is a single attempt, identical to the prior behavior.
+	if c.cfg.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.cfg.ConnectTimeout)
+		defer cancel()
+	}
+
+	var session *cli_service.TOpenSessionResp
+	var openErr error
+	wait := c.cfg.RetryWaitMin
+	if wait <= 0 {
+		wait = 1 * time.Second
+	}
+	waitMax := c.cfg.RetryWaitMax
+	if waitMax <= 0 {
+		waitMax = 30 * time.Second
+	}
+	for {
+		session, openErr = tclient.OpenSession(ctx, openReq)
+		if openErr == nil {
+			break
+		}
+		// Stop unless the connect budget is set, the deadline is still open, and the
+		// failure is transient (e.g. a cold-starting warehouse returning HTTP 503).
+		// Non-retryable failures (bad token, missing warehouse, ...) fail fast rather
+		// than waiting out the whole ConnectTimeout.
+		if c.cfg.ConnectTimeout <= 0 || ctx.Err() != nil || !errors.Is(openErr, dbsqlerrint.RetryableError) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		wait *= 2
+		if wait > waitMax {
+			wait = waitMax
+		}
+	}
+	if openErr != nil {
+		return nil, dbsqlerrint.NewRequestError(ctx, fmt.Sprintf("error connecting: host=%s port=%d, httpPath=%s", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath), openErr)
 	}
 
 	conn := &conn{
@@ -199,6 +248,16 @@ func WithMaxRows(n int) ConnOption {
 func WithTimeout(n time.Duration) ConnOption {
 	return func(c *config.Config) {
 		c.QueryTimeout = n
+	}
+}
+
+// WithConnectTimeout bounds how long establishing a session (OpenSession) may
+// take and keeps retrying an unavailable warehouse until that deadline, so a
+// cold-starting cluster has time to come up. Default (0) is a single attempt
+// with no added bound, preserving the prior behavior.
+func WithConnectTimeout(n time.Duration) ConnOption {
+	return func(c *config.Config) {
+		c.ConnectTimeout = n
 	}
 }
 
