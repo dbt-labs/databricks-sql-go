@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -54,7 +55,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 
 	protocolVersion := int64(c.cfg.ThriftProtocolVersion)
-	session, err := tclient.OpenSession(ctx, &cli_service.TOpenSessionReq{
+	openReq := &cli_service.TOpenSessionReq{
 		ClientProtocolI64: &protocolVersion,
 		Configuration:     sessionParams,
 		InitialNamespace: &cli_service.TNamespace{
@@ -62,9 +63,18 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 			SchemaName:  schemaName,
 		},
 		CanUseMultipleCatalogs: &c.cfg.CanUseMultipleCatalogs,
-	})
-	if err != nil {
-		return nil, dbsqlerrint.NewRequestError(ctx, fmt.Sprintf("error connecting: host=%s port=%d, httpPath=%s", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath), err)
+	}
+
+	// ConnectTimeout unset (<= 0): single attempt, identical to prior behavior.
+	var session *cli_service.TOpenSessionResp
+	var openErr error
+	if c.cfg.ConnectTimeout <= 0 {
+		session, openErr = tclient.OpenSession(ctx, openReq)
+	} else {
+		session, openErr = c.openSessionWithRetry(ctx, tclient, openReq)
+	}
+	if openErr != nil {
+		return nil, dbsqlerrint.NewRequestError(ctx, fmt.Sprintf("error connecting: host=%s port=%d, httpPath=%s", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath), openErr)
 	}
 
 	conn := &conn{
@@ -78,6 +88,49 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	log.Info().Msgf("connect: host=%s port=%d httpPath=%s serverProtocolVersion=0x%X", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath, session.ServerProtocolVersion)
 
 	return conn, nil
+}
+
+// openSessionWithRetry bounds OpenSession by cfg.ConnectTimeout and retries with
+// exponential backoff while the failure is transient (e.g. a cold-starting
+// warehouse returning HTTP 503), so a slow cold start succeeds instead of
+// failing once the per-request retry budget (RetryMax) is exhausted. These
+// connect retries are independent of the query-level RetryMax. Non-retryable
+// failures (bad token, missing warehouse, ...) fail fast.
+func (c *connector) openSessionWithRetry(ctx context.Context, tclient cli_service.TCLIService, req *cli_service.TOpenSessionReq) (*cli_service.TOpenSessionResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
+	defer cancel()
+
+	wait := c.cfg.RetryWaitMin
+	if wait <= 0 {
+		wait = 1 * time.Second
+	}
+	waitMax := c.cfg.RetryWaitMax
+	if waitMax <= 0 {
+		waitMax = 30 * time.Second
+	}
+
+	log := logger.WithContext("", driverctx.CorrelationIdFromContext(ctx), "")
+	for attempt := 1; ; attempt++ {
+		session, err := tclient.OpenSession(ctx, req)
+		if err == nil {
+			return session, nil
+		}
+		if !errors.Is(err, dbsqlerrint.RetryableError) {
+			return nil, err
+		}
+
+		log.Debug().Err(err).Msgf("connect: attempt %d failed, retrying in %s", attempt, wait)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(wait):
+		}
+
+		wait *= 2
+		if wait > waitMax {
+			wait = waitMax
+		}
+	}
 }
 
 // Driver returns underlying databricksDriver for compatibility with sql.DB Driver method
@@ -200,6 +253,16 @@ func WithMaxRows(n int) ConnOption {
 func WithTimeout(n time.Duration) ConnOption {
 	return func(c *config.Config) {
 		c.QueryTimeout = n
+	}
+}
+
+// WithConnectTimeout bounds how long establishing a session (OpenSession) may
+// take and keeps retrying an unavailable warehouse until that deadline, so a
+// cold-starting cluster has time to come up. Default (0) is a single attempt
+// with no added bound, preserving the prior behavior.
+func WithConnectTimeout(n time.Duration) ConnOption {
+	return func(c *config.Config) {
+		c.ConnectTimeout = n
 	}
 }
 
