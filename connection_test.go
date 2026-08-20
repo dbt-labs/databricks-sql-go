@@ -677,6 +677,72 @@ func TestConn_pollOperation(t *testing.T) {
 		}, *res)
 	})
 
+	t.Run("pollOperation keeps polling and recovers when GetOperationStatus fails at the transport level", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			if getOperationStatusCount <= 2 {
+				// Simulate a transport-level failure (e.g. a dropped connection):
+				// no response is available, only an error.
+				return nil, errors.New("transient network error")
+			}
+			getOperationStatusResp := &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+			}
+			return getOperationStatusResp, nil
+		}
+		testClient := &client.TestClient{
+			FnGetOperationStatus: getOperationStatus,
+		}
+		testConn := &conn{
+			session: getTestSession(),
+			client:  testClient,
+			cfg:     config.WithDefaults(),
+		}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{
+				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 55},
+				Secret: []byte("b"),
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, 3, getOperationStatusCount)
+		assert.Equal(t, cli_service.TGetOperationStatusResp{
+			OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+		}, *res)
+	})
+
+	t.Run("pollOperation still returns an error when GetOperationStatus returns a real status error", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			// A non-nil response alongside a non-nil error means the RPC
+			// itself succeeded but the server-reported status was an error --
+			// this must still be treated as terminal, not retried forever.
+			getOperationStatusResp := &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_ERROR_STATE),
+			}
+			return getOperationStatusResp, errors.New("invalid operation handle")
+		}
+		testClient := &client.TestClient{
+			FnGetOperationStatus: getOperationStatus,
+		}
+		testConn := &conn{
+			session: getTestSession(),
+			client:  testClient,
+			cfg:     config.WithDefaults(),
+		}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{
+				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 56},
+				Secret: []byte("b"),
+			},
+		})
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		assert.Equal(t, 1, getOperationStatusCount)
+	})
+
 	t.Run("pollOperation returns cancel err when context times out before get operation", func(t *testing.T) {
 		var getOperationStatusCount, cancelOperationCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {

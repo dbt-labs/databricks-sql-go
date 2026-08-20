@@ -379,6 +379,18 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 				OperationHandle: opHandle,
 			})
 
+			// A transport-level failure (e.g. an idle connection dropped by a
+			// network intermediary) never reaches the server, so statusResp is
+			// nil here -- it tells us nothing about the operation's actual
+			// state. The query may still be running. Treat it as "not done
+			// yet" and keep polling on the next interval instead of abandoning
+			// a possibly still-executing operation; ctx cancellation remains
+			// the backstop for a persistently broken connection.
+			if err != nil && statusResp == nil {
+				log.Warn().Err(err).Msg("databricks: transient error polling operation status, will retry")
+				return func() bool { return false }, nil, nil
+			}
+
 			if statusResp != nil && statusResp.OperationState != nil {
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
 			}
