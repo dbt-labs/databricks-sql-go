@@ -677,48 +677,106 @@ func TestConn_pollOperation(t *testing.T) {
 		}, *res)
 	})
 
-	t.Run("pollOperation keeps polling and recovers when GetOperationStatus fails at the transport level", func(t *testing.T) {
+	t.Run("pollOperation recovers from ambiguous transport errors within the cap", func(t *testing.T) {
 		var getOperationStatusCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
 			getOperationStatusCount++
-			if getOperationStatusCount <= 2 {
-				// Simulate a transport-level failure (e.g. a dropped connection):
-				// no response is available, only an error.
-				return nil, errors.New("transient network error")
+			if getOperationStatusCount <= maxAmbiguousPollErrors {
+				return nil, errors.New("connection reset by peer")
 			}
-			getOperationStatusResp := &cli_service.TGetOperationStatusResp{
+			return &cli_service.TGetOperationStatusResp{
 				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
-			}
-			return getOperationStatusResp, nil
+			}, nil
 		}
-		testClient := &client.TestClient{
-			FnGetOperationStatus: getOperationStatus,
-		}
-		testConn := &conn{
-			session: getTestSession(),
-			client:  testClient,
-			cfg:     config.WithDefaults(),
-		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		testConn := &conn{session: getTestSession(), client: testClient, cfg: config.WithDefaults()}
 		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
-			OperationId: &cli_service.THandleIdentifier{
-				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 55},
-				Secret: []byte("b"),
-			},
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 55}, Secret: []byte("b")},
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, 3, getOperationStatusCount)
-		assert.Equal(t, cli_service.TGetOperationStatusResp{
-			OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
-		}, *res)
+		assert.Equal(t, cli_service.TOperationState_FINISHED_STATE, res.GetOperationState())
+	})
+
+	t.Run("pollOperation gives up after exceeding the ambiguous transport error cap", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			return nil, errors.New("connection reset by peer")
+		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		testConn := &conn{session: getTestSession(), client: testClient, cfg: config.WithDefaults()}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 56}, Secret: []byte("b")},
+		})
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		assert.Equal(t, maxAmbiguousPollErrors+1, getOperationStatusCount)
+	})
+
+	t.Run("pollOperation recovers from confidently transient errors then succeeds", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			if getOperationStatusCount <= 10 {
+				return nil, thrift.NewTTransportException(thrift.TIMED_OUT, "i/o timeout")
+			}
+			return &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+			}, nil
+		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = 100 * time.Millisecond
+		testConn := &conn{session: getTestSession(), client: testClient, cfg: cfg}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 57}, Secret: []byte("b")},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, cli_service.TOperationState_FINISHED_STATE, res.GetOperationState())
+	})
+
+	t.Run("pollOperation is bounded even for confidently transient errors that never resolve", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			return nil, thrift.NewTTransportException(thrift.END_OF_FILE, "EOF")
+		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = 100 * time.Millisecond
+		testConn := &conn{session: getTestSession(), client: testClient, cfg: cfg}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 58}, Secret: []byte("b")},
+		})
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		assert.Equal(t, maxTransientPollErrors+1, getOperationStatusCount)
+	})
+
+	t.Run("pollOperation fails immediately on a permanent client error", func(t *testing.T) {
+		for i, status := range []string{"401", "403", "404"} {
+			t.Run(status, func(t *testing.T) {
+				var getOperationStatusCount int
+				getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+					getOperationStatusCount++
+					return nil, fmt.Errorf("unexpected HTTP status %s Forbidden", status)
+				}
+				testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+				testConn := &conn{session: getTestSession(), client: testClient, cfg: config.WithDefaults()}
+				res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+					OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, byte(60 + i)}, Secret: []byte("b")},
+				})
+				assert.Error(t, err)
+				assert.Nil(t, res)
+				assert.Equal(t, 1, getOperationStatusCount)
+			})
+		}
 	})
 
 	t.Run("pollOperation still returns an error when GetOperationStatus returns a real status error", func(t *testing.T) {
 		var getOperationStatusCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
 			getOperationStatusCount++
-			// A non-nil response alongside a non-nil error means the RPC
-			// itself succeeded but the server-reported status was an error --
-			// this must still be treated as terminal, not retried forever.
 			getOperationStatusResp := &cli_service.TGetOperationStatusResp{
 				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_ERROR_STATE),
 			}
@@ -734,7 +792,7 @@ func TestConn_pollOperation(t *testing.T) {
 		}
 		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
 			OperationId: &cli_service.THandleIdentifier{
-				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 56},
+				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 59},
 				Secret: []byte("b"),
 			},
 		})

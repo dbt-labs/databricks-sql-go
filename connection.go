@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/databricks/databricks-sql-go/driverctx"
 	dbsqlerr "github.com/databricks/databricks-sql-go/errors"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
@@ -362,10 +364,31 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 	return resp, err
 }
 
+const (
+	maxTransientPollErrors = 30
+	maxAmbiguousPollErrors = 2
+)
+
+var permanentClientStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
+
+func isPermanentClientError(err error) bool {
+	return permanentClientStatusRe.MatchString(err.Error())
+}
+
+func isConfidentTransientError(err error) bool {
+	var transportErr thrift.TTransportException
+	if !errors.As(err, &transportErr) {
+		return false
+	}
+	return transportErr.TypeId() == thrift.TIMED_OUT || transportErr.TypeId() == thrift.END_OF_FILE
+}
+
 func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperationHandle) (*cli_service.TGetOperationStatusResp, error) {
 	corrId := driverctx.CorrelationIdFromContext(ctx)
 	log := logger.WithContext(c.id, corrId, client.SprintGuid(opHandle.OperationId.GUID))
 	var statusResp *cli_service.TGetOperationStatusResp
+	var lastState *cli_service.TOperationState
+	var transientErrors, ambiguousErrors int
 	ctx = driverctx.NewContextWithConnId(ctx, c.id)
 	newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
 	pollSentinel := sentinel.Sentinel{
@@ -379,19 +402,32 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 				OperationHandle: opHandle,
 			})
 
-			// A transport-level failure (e.g. an idle connection dropped by a
-			// network intermediary) never reaches the server, so statusResp is
-			// nil here -- it tells us nothing about the operation's actual
-			// state. The query may still be running. Treat it as "not done
-			// yet" and keep polling on the next interval instead of abandoning
-			// a possibly still-executing operation; ctx cancellation remains
-			// the backstop for a persistently broken connection.
-			if err != nil && statusResp == nil {
-				log.Warn().Err(err).Msg("databricks: transient error polling operation status, will retry")
+			if statusResp == nil && err != nil {
+				giveUp := isPermanentClientError(err)
+				if !giveUp {
+					if isConfidentTransientError(err) {
+						transientErrors++
+						giveUp = transientErrors > maxTransientPollErrors
+					} else {
+						ambiguousErrors++
+						giveUp = ambiguousErrors > maxAmbiguousPollErrors
+					}
+				}
+				if giveUp {
+					state := "unknown"
+					if lastState != nil {
+						state = lastState.String()
+					}
+					msg := fmt.Sprintf("giving up polling operation %s, last known state %s", client.SprintGuid(opHandle.OperationId.GUID), state)
+					return nil, statusResp, dbsqlerrint.NewRequestError(ctx, msg, err)
+				}
+				log.Warn().Err(err).Msg("databricks: polling status failed, retrying")
 				return func() bool { return false }, nil, nil
 			}
 
+			transientErrors, ambiguousErrors = 0, 0
 			if statusResp != nil && statusResp.OperationState != nil {
+				lastState = statusResp.OperationState
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
 			}
 			return func() bool {
