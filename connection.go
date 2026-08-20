@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/databricks/databricks-sql-go/driverctx"
 	dbsqlerr "github.com/databricks/databricks-sql-go/errors"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
@@ -364,23 +363,12 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 	return resp, err
 }
 
-const (
-	maxTransientPollErrors = 30
-	maxAmbiguousPollErrors = 2
-)
+const maxPollFailures = 30
 
-var permanentClientStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
+var clientErrorStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
 
-func isPermanentClientError(err error) bool {
-	return permanentClientStatusRe.MatchString(err.Error())
-}
-
-func isConfidentTransientError(err error) bool {
-	var transportErr thrift.TTransportException
-	if !errors.As(err, &transportErr) {
-		return false
-	}
-	return transportErr.TypeId() == thrift.TIMED_OUT || transportErr.TypeId() == thrift.END_OF_FILE
+func isClientError(err error) bool {
+	return clientErrorStatusRe.MatchString(err.Error())
 }
 
 func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperationHandle) (*cli_service.TGetOperationStatusResp, error) {
@@ -388,7 +376,7 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 	log := logger.WithContext(c.id, corrId, client.SprintGuid(opHandle.OperationId.GUID))
 	var statusResp *cli_service.TGetOperationStatusResp
 	var lastState *cli_service.TOperationState
-	var transientErrors, ambiguousErrors int
+	var pollFailures int
 	ctx = driverctx.NewContextWithConnId(ctx, c.id)
 	newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
 	pollSentinel := sentinel.Sentinel{
@@ -403,17 +391,9 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 			})
 
 			if statusResp == nil && err != nil {
-				giveUp := isPermanentClientError(err)
-				if !giveUp {
-					if isConfidentTransientError(err) {
-						transientErrors++
-						giveUp = transientErrors > maxTransientPollErrors
-					} else {
-						ambiguousErrors++
-						giveUp = ambiguousErrors > maxAmbiguousPollErrors
-					}
-				}
-				if giveUp {
+				pollFailures++
+				retryable := pollFailures <= maxPollFailures && !isClientError(err)
+				if !retryable {
 					state := "unknown"
 					if lastState != nil {
 						state = lastState.String()
@@ -425,7 +405,7 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 				return func() bool { return false }, nil, nil
 			}
 
-			transientErrors, ambiguousErrors = 0, 0
+			pollFailures = 0
 			if statusResp != nil && statusResp.OperationState != nil {
 				lastState = statusResp.OperationState
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
