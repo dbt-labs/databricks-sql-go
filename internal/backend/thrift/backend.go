@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/databricks/databricks-sql-go/driverctx"
@@ -358,6 +359,14 @@ func (b *Backend) executeStatement(ctx context.Context, req backend.ExecRequest)
 	return resp, err
 }
 
+const maxPollFailures = 30
+
+var clientErrorStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
+
+func isClientError(err error) bool {
+	return clientErrorStatusRe.MatchString(err.Error())
+}
+
 // pollOperation polls the operation status until it reaches a terminal state,
 // cancelling the operation if the context is done (via the sentinel poll loop).
 func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOperationHandle) (*cli_service.TGetOperationStatusResp, error) {
@@ -367,6 +376,8 @@ func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOper
 	defer debuglog.Track(ctx, "thrift.Backend.pollOperation", "op=%s", opID)()
 
 	var statusResp *cli_service.TGetOperationStatusResp
+	var lastState *cli_service.TOperationState
+	var pollFailures int
 	ctx = driverctx.NewContextWithConnId(ctx, b.SessionID())
 	newCtx := context2.WithoutCancel(ctx)
 	pollSentinel := sentinel.Sentinel{
@@ -381,7 +392,24 @@ func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOper
 				OperationHandle: opHandle,
 			})
 
+			if statusResp == nil && err != nil {
+				pollFailures++
+				retryable := pollFailures <= maxPollFailures && !isClientError(err)
+				if !retryable {
+					state := "unknown"
+					if lastState != nil {
+						state = lastState.String()
+					}
+					msg := fmt.Sprintf("giving up polling operation %s, last known state %s", opID, state)
+					return nil, statusResp, dbsqlerrint.NewRequestError(ctx, msg, err)
+				}
+				log.Warn().Err(err).Msg("databricks: polling status failed, retrying")
+				return func() bool { return false }, nil, nil
+			}
+
+			pollFailures = 0
 			if statusResp != nil && statusResp.OperationState != nil {
+				lastState = statusResp.OperationState
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
 			}
 			return func() bool {
