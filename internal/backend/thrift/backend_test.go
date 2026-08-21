@@ -760,6 +760,90 @@ func TestBackend_pollOperation(t *testing.T) {
 		}, *res)
 	})
 
+	t.Run("pollOperation recovers from transport errors within the cap", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			if getOperationStatusCount <= maxPollFailures {
+				return nil, errors.New("connection reset by peer")
+			}
+			return &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+			}, nil
+		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = 10 * time.Millisecond
+		be := NewForTest(testClient, getTestSession(), cfg)
+		res, err := be.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 55}, Secret: []byte("b")},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, cli_service.TOperationState_FINISHED_STATE, res.GetOperationState())
+	})
+
+	t.Run("pollOperation gives up after exceeding the transport error cap", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			return nil, errors.New("connection reset by peer")
+		}
+		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = 10 * time.Millisecond
+		be := NewForTest(testClient, getTestSession(), cfg)
+		res, err := be.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 56}, Secret: []byte("b")},
+		})
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		assert.Equal(t, maxPollFailures+1, getOperationStatusCount)
+	})
+
+	t.Run("pollOperation fails immediately on a client error", func(t *testing.T) {
+		for i, status := range []string{"401", "403", "404"} {
+			t.Run(status, func(t *testing.T) {
+				var getOperationStatusCount int
+				getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+					getOperationStatusCount++
+					return nil, fmt.Errorf("unexpected HTTP status %s Forbidden", status)
+				}
+				testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
+				be := NewForTest(testClient, getTestSession(), config.WithDefaults())
+				res, err := be.pollOperation(context.Background(), &cli_service.TOperationHandle{
+					OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, byte(60 + i)}, Secret: []byte("b")},
+				})
+				assert.Error(t, err)
+				assert.Nil(t, res)
+				assert.Equal(t, 1, getOperationStatusCount)
+			})
+		}
+	})
+
+	t.Run("pollOperation still returns an error when GetOperationStatus returns a real status error", func(t *testing.T) {
+		var getOperationStatusCount int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			getOperationStatusCount++
+			getOperationStatusResp := &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_ERROR_STATE),
+			}
+			return getOperationStatusResp, errors.New("invalid operation handle")
+		}
+		testClient := &client.TestClient{
+			FnGetOperationStatus: getOperationStatus,
+		}
+		be := NewForTest(testClient, getTestSession(), config.WithDefaults())
+		res, err := be.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{
+				GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 59},
+				Secret: []byte("b"),
+			},
+		})
+		assert.Error(t, err)
+		assert.Nil(t, res)
+		assert.Equal(t, 1, getOperationStatusCount)
+	})
+
 	t.Run("pollOperation returns cancel err when context times out before get operation", func(t *testing.T) {
 		var getOperationStatusCount, cancelOperationCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
