@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql/driver"
+	"errors"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"github.com/databricks/databricks-sql-go/internal/client"
 	"github.com/databricks/databricks-sql-go/internal/config"
 	"github.com/databricks/databricks-sql-go/internal/debuglog"
+	dbsqlerrint "github.com/databricks/databricks-sql-go/internal/errors"
 	"github.com/databricks/databricks-sql-go/logger"
 	"github.com/databricks/databricks-sql-go/telemetry"
 )
@@ -39,9 +41,47 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, err
 	}
 
+	// ConnectTimeout <= 0 preserves prior behavior: a single OpenSession attempt,
+	// unbounded, with no extra retries beyond the query-level RetryMax.
+	if c.cfg.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.cfg.ConnectTimeout)
+		defer cancel()
+	}
+
+	wait := c.cfg.RetryWaitMin
+	if wait <= 0 {
+		wait = 1 * time.Second
+	}
+	waitMax := c.cfg.RetryWaitMax
+	if waitMax <= 0 {
+		waitMax = 30 * time.Second
+	}
+
 	sessionStart := time.Now()
-	if err := be.OpenSession(ctx); err != nil {
-		return nil, err
+	var openErr error
+	for {
+		openErr = be.OpenSession(ctx)
+		if openErr == nil {
+			break
+		}
+		if c.cfg.ConnectTimeout <= 0 || ctx.Err() != nil || !errors.Is(openErr, dbsqlerrint.RetryableError) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		wait *= 2
+		if wait > waitMax {
+			wait = waitMax
+		}
+	}
+	if openErr != nil {
+		return nil, openErr
 	}
 	sessionLatencyMs := time.Since(sessionStart).Milliseconds()
 
@@ -314,6 +354,16 @@ func WithMaxRows(n int) ConnOption {
 func WithTimeout(n time.Duration) ConnOption {
 	return func(c *config.Config) {
 		c.QueryTimeout = n
+	}
+}
+
+// WithConnectTimeout bounds how long establishing a session (OpenSession) may
+// take and keeps retrying an unavailable warehouse until that deadline, so a
+// cold-starting cluster has time to come up. Default (0) is a single attempt
+// with no added bound, preserving the prior behavior.
+func WithConnectTimeout(n time.Duration) ConnOption {
+	return func(c *config.Config) {
+		c.ConnectTimeout = n
 	}
 }
 

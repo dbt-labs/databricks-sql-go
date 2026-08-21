@@ -381,3 +381,30 @@ var _ http.RoundTripper = mockRoundTripper{}
 func (m mockRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 200}, nil
 }
+
+func TestWithConnectTimeout(t *testing.T) {
+	t.Run("sets ConnectTimeout on the config", func(t *testing.T) {
+		con, err := NewConnector(
+			WithServerHostname("databricks-host"),
+			WithAccessToken("token"),
+			WithHTTPPath("http-path"),
+			WithConnectTimeout(600*time.Second),
+		)
+		require.NoError(t, err)
+		coni, ok := con.(*connector)
+		require.True(t, ok)
+		assert.Equal(t, 600*time.Second, coni.cfg.ConnectTimeout)
+	})
+
+	t.Run("defaults to zero (single attempt, prior behavior)", func(t *testing.T) {
+		con, err := NewConnector(
+			WithServerHostname("databricks-host"),
+			WithAccessToken("token"),
+			WithHTTPPath("http-path"),
+		)
+		require.NoError(t, err)
+		coni, ok := con.(*connector)
+		require.True(t, ok)
+		assert.Equal(t, time.Duration(0), coni.cfg.ConnectTimeout)
+	})
+}

@@ -41,6 +41,7 @@ type Config struct {
 	PollInterval              time.Duration
 	ClientTimeout             time.Duration // max time the http request can last
 	PingTimeout               time.Duration // max time allowed for ping
+	ConnectTimeout            time.Duration // max time allowed to establish a session (0 = single attempt, no bound)
 	CanUseMultipleCatalogs    bool
 	DriverName                string
 	DriverVersion             string
@@ -79,6 +80,7 @@ func (c *Config) DeepCopy() *Config {
 		PollInterval:              c.PollInterval,
 		ClientTimeout:             c.ClientTimeout,
 		PingTimeout:               c.PingTimeout,
+		ConnectTimeout:            c.ConnectTimeout,
 		CanUseMultipleCatalogs:    c.CanUseMultipleCatalogs,
 		DriverName:                c.DriverName,
 		DriverVersion:             c.DriverVersion,
@@ -125,7 +127,7 @@ type UserConfig struct {
 	// See databricks/databricks-sql-go#274.
 	UseArrowNativeDecimalDSN bool
 	// Port for OAuth U2M redirect callback (default: 8030)
-	OAuthRedirectPort        int
+	OAuthRedirectPort int
 	CloudFetchConfig
 }
 
