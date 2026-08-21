@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -362,10 +363,20 @@ func (c *conn) executeStatement(ctx context.Context, query string, args []driver
 	return resp, err
 }
 
+const maxPollFailures = 30
+
+var clientErrorStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
+
+func isClientError(err error) bool {
+	return clientErrorStatusRe.MatchString(err.Error())
+}
+
 func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperationHandle) (*cli_service.TGetOperationStatusResp, error) {
 	corrId := driverctx.CorrelationIdFromContext(ctx)
 	log := logger.WithContext(c.id, corrId, client.SprintGuid(opHandle.OperationId.GUID))
 	var statusResp *cli_service.TGetOperationStatusResp
+	var lastState *cli_service.TOperationState
+	var pollFailures int
 	ctx = driverctx.NewContextWithConnId(ctx, c.id)
 	newCtx := driverctx.NewContextWithCorrelationId(driverctx.NewContextWithConnId(context.Background(), c.id), corrId)
 	pollSentinel := sentinel.Sentinel{
@@ -379,7 +390,24 @@ func (c *conn) pollOperation(ctx context.Context, opHandle *cli_service.TOperati
 				OperationHandle: opHandle,
 			})
 
+			if statusResp == nil && err != nil {
+				pollFailures++
+				retryable := pollFailures <= maxPollFailures && !isClientError(err)
+				if !retryable {
+					state := "unknown"
+					if lastState != nil {
+						state = lastState.String()
+					}
+					msg := fmt.Sprintf("giving up polling operation %s, last known state %s", client.SprintGuid(opHandle.OperationId.GUID), state)
+					return nil, statusResp, dbsqlerrint.NewRequestError(ctx, msg, err)
+				}
+				log.Warn().Err(err).Msg("databricks: polling status failed, retrying")
+				return func() bool { return false }, nil, nil
+			}
+
+			pollFailures = 0
 			if statusResp != nil && statusResp.OperationState != nil {
+				lastState = statusResp.OperationState
 				log.Debug().Msgf("databricks: status %s", statusResp.GetOperationState().String())
 			}
 			return func() bool {
