@@ -359,7 +359,19 @@ func (b *Backend) executeStatement(ctx context.Context, req backend.ExecRequest)
 	return resp, err
 }
 
-const maxPollFailures = 30
+func pollBackoff(interval, max time.Duration, n int) time.Duration {
+	if interval <= 0 || n < 2 {
+		return 0
+	}
+	d := interval
+	for i := 1; i < n && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d - interval
+}
 
 var clientErrorStatusRe = regexp.MustCompile(`unexpected HTTP status (401|403|404)\b`)
 
@@ -378,6 +390,8 @@ func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOper
 	var statusResp *cli_service.TGetOperationStatusResp
 	var lastState *cli_service.TOperationState
 	var pollFailures int
+	var firstFailure time.Time
+	budget := b.cfg.PollRetryTimeout
 	ctx = driverctx.NewContextWithConnId(ctx, b.SessionID())
 	newCtx := context2.WithoutCancel(ctx)
 	pollSentinel := sentinel.Sentinel{
@@ -394,7 +408,10 @@ func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOper
 
 			if statusResp == nil && err != nil {
 				pollFailures++
-				retryable := pollFailures <= maxPollFailures && !isClientError(err)
+				if pollFailures == 1 {
+					firstFailure = time.Now()
+				}
+				retryable := time.Since(firstFailure) <= budget && !isClientError(err)
 				if !retryable {
 					state := "unknown"
 					if lastState != nil {
@@ -404,6 +421,12 @@ func (b *Backend) pollOperation(ctx context.Context, opHandle *cli_service.TOper
 					return nil, statusResp, dbsqlerrint.NewRequestError(ctx, msg, err)
 				}
 				log.Warn().Err(err).Msg("databricks: polling status failed, retrying")
+				if wait := pollBackoff(b.cfg.PollInterval, b.cfg.RetryWaitMax, pollFailures); wait > 0 {
+					select {
+					case <-time.After(wait):
+					case <-ctx.Done():
+					}
+				}
 				return func() bool { return false }, nil, nil
 			}
 

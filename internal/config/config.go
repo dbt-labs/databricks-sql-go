@@ -39,6 +39,7 @@ type Config struct {
 	TLSConfig *tls.Config // nil disables TLS
 	ArrowConfig
 	PollInterval              time.Duration
+	PollRetryTimeout          time.Duration // max time status polling keeps retrying consecutive failed requests
 	ClientTimeout             time.Duration // max time the http request can last
 	PingTimeout               time.Duration // max time allowed for ping
 	ConnectTimeout            time.Duration // max time allowed to establish a session (0 = single attempt, no bound)
@@ -78,6 +79,7 @@ func (c *Config) DeepCopy() *Config {
 		TLSConfig:                 c.TLSConfig.Clone(),
 		ArrowConfig:               c.ArrowConfig.DeepCopy(),
 		PollInterval:              c.PollInterval,
+		PollRetryTimeout:          c.PollRetryTimeout,
 		ClientTimeout:             c.ClientTimeout,
 		PingTimeout:               c.PingTimeout,
 		ConnectTimeout:            c.ConnectTimeout,
@@ -227,6 +229,7 @@ func WithDefaults() *Config {
 		TLSConfig:                 &tls.Config{MinVersion: tls.VersionTLS12},
 		ArrowConfig:               ArrowConfig{}.WithDefaults(),
 		PollInterval:              1 * time.Second,
+		PollRetryTimeout:          5 * time.Minute,
 		ClientTimeout:             900 * time.Second,
 		PingTimeout:               60 * time.Second,
 		CanUseMultipleCatalogs:    true,
