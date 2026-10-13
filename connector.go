@@ -217,6 +217,14 @@ func WithRetries(retryMax int, retryWaitMin time.Duration, retryWaitMax time.Dur
 	}
 }
 
+func WithPollRetryTimeout(d time.Duration) ConnOption {
+	return func(c *config.Config) {
+		if d > 0 {
+			c.PollRetryTimeout = d
+		}
+	}
+}
+
 // WithAccessToken sets up the Personal Access Token. Mandatory for now.
 func WithAccessToken(token string) ConnOption {
 	return func(c *config.Config) {

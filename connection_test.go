@@ -677,11 +677,12 @@ func TestConn_pollOperation(t *testing.T) {
 		}, *res)
 	})
 
-	t.Run("pollOperation recovers from transport errors within the cap", func(t *testing.T) {
+	t.Run("pollOperation recovers from transport errors within the retry timeout", func(t *testing.T) {
+		const failureCount = 40
 		var getOperationStatusCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
 			getOperationStatusCount++
-			if getOperationStatusCount <= maxPollFailures {
+			if getOperationStatusCount <= failureCount {
 				return nil, errors.New("connection reset by peer")
 			}
 			return &cli_service.TGetOperationStatusResp{
@@ -690,16 +691,19 @@ func TestConn_pollOperation(t *testing.T) {
 		}
 		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
 		cfg := config.WithDefaults()
-		cfg.PollInterval = 10 * time.Millisecond
+		cfg.PollInterval = time.Millisecond
+		cfg.RetryWaitMax = 2 * time.Millisecond
+		cfg.PollRetryTimeout = 10 * time.Second
 		testConn := &conn{session: getTestSession(), client: testClient, cfg: cfg}
 		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
 			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 55}, Secret: []byte("b")},
 		})
 		assert.NoError(t, err)
+		assert.Equal(t, failureCount+1, getOperationStatusCount)
 		assert.Equal(t, cli_service.TOperationState_FINISHED_STATE, res.GetOperationState())
 	})
 
-	t.Run("pollOperation gives up after exceeding the transport error cap", func(t *testing.T) {
+	t.Run("pollOperation gives up once failures outlast the retry timeout", func(t *testing.T) {
 		var getOperationStatusCount int
 		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
 			getOperationStatusCount++
@@ -707,14 +711,50 @@ func TestConn_pollOperation(t *testing.T) {
 		}
 		testClient := &client.TestClient{FnGetOperationStatus: getOperationStatus}
 		cfg := config.WithDefaults()
-		cfg.PollInterval = 10 * time.Millisecond
+		cfg.PollInterval = time.Millisecond
+		cfg.RetryWaitMax = 2 * time.Millisecond
+		cfg.PollRetryTimeout = 50 * time.Millisecond
 		testConn := &conn{session: getTestSession(), client: testClient, cfg: cfg}
+		start := time.Now()
 		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
 			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 56}, Secret: []byte("b")},
 		})
 		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "giving up polling operation")
 		assert.Nil(t, res)
-		assert.Equal(t, maxPollFailures+1, getOperationStatusCount)
+		assert.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+		assert.Greater(t, getOperationStatusCount, 2)
+	})
+
+	t.Run("pollOperation restarts the retry window after a successful poll", func(t *testing.T) {
+		var count int
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			count++
+			switch count {
+			case 1, 3, 5:
+				time.Sleep(30 * time.Millisecond)
+				return nil, errors.New("connection reset by peer")
+			case 2, 4:
+				return &cli_service.TGetOperationStatusResp{OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_RUNNING_STATE)}, nil
+			}
+			return &cli_service.TGetOperationStatusResp{OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE)}, nil
+		}
+		cfg := config.WithDefaults()
+		cfg.PollInterval = time.Millisecond
+		cfg.PollRetryTimeout = 40 * time.Millisecond
+		testConn := &conn{session: getTestSession(), client: &client.TestClient{FnGetOperationStatus: getOperationStatus}, cfg: cfg}
+		res, err := testConn.pollOperation(context.Background(), &cli_service.TOperationHandle{
+			OperationId: &cli_service.THandleIdentifier{GUID: []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 1, 3, 4, 4, 223, 34, 57}, Secret: []byte("b")},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, cli_service.TOperationState_FINISHED_STATE, res.GetOperationState())
+	})
+
+	t.Run("pollBackoff doubles the wait up to the cap", func(t *testing.T) {
+		assert.Equal(t, time.Duration(0), pollBackoff(time.Second, 30*time.Second, 1))
+		assert.Equal(t, time.Second, pollBackoff(time.Second, 30*time.Second, 2))
+		assert.Equal(t, 3*time.Second, pollBackoff(time.Second, 30*time.Second, 3))
+		assert.Equal(t, 29*time.Second, pollBackoff(time.Second, 30*time.Second, 20))
 	})
 
 	t.Run("pollOperation fails immediately on a client error", func(t *testing.T) {
