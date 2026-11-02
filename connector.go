@@ -436,6 +436,17 @@ func WithTimeout(n time.Duration) ConnOption {
 	}
 }
 
+// WithConnectTimeout bounds how long establishing a session (OpenSession) may
+// take and keeps retrying an unavailable warehouse until that deadline, so a
+// cold-starting cluster has time to come up. Default (0) is a single attempt
+// with no added bound, preserving the prior behavior. Applies to the Thrift
+// backend only.
+func WithConnectTimeout(n time.Duration) ConnOption {
+	return func(c *config.Config) {
+		c.ConnectTimeout = n
+	}
+}
+
 // WithClientQueryTimeout sets a client-side deadline for kernel statement
 // execution. It is independent of WithTimeout, which remains a server-side
 // Thrift option. A positive duration is rounded up to the next millisecond;

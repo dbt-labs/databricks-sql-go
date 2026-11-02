@@ -57,6 +57,16 @@ func TestFederatedTokenAuthenticatorPreservesThriftTokenExchange(t *testing.T) {
 	assert.Equal(t, subjectToken, exchange.subjectToken)
 }
 
+func TestWithConnectTimeout(t *testing.T) {
+	con, err := NewConnector()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), con.(*connector).cfg.ConnectTimeout)
+
+	con, err = NewConnector(WithConnectTimeout(600 * time.Second))
+	require.NoError(t, err)
+	assert.Equal(t, 600*time.Second, con.(*connector).cfg.ConnectTimeout)
+}
+
 func TestWithClientQueryTimeout(t *testing.T) {
 	t.Run("omitted remains distinguishable from explicit zero", func(t *testing.T) {
 		con, err := NewConnector(WithUseKernel(true))
