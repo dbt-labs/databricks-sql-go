@@ -134,6 +134,49 @@ func TestConn_ExecContext(t *testing.T) {
 		assert.Equal(t, int64(10), rowsAffected)
 		assert.Equal(t, 1, executeStatementCount)
 	})
+	t.Run("ExecContext reports -1 rows affected when the server reports no modified rows", func(t *testing.T) {
+		executeStatement := func(ctx context.Context, req *cli_service.TExecuteStatementReq) (r *cli_service.TExecuteStatementResp, err error) {
+			return &cli_service.TExecuteStatementResp{
+				Status: &cli_service.TStatus{
+					StatusCode: cli_service.TStatusCode_SUCCESS_STATUS,
+				},
+				OperationHandle: &cli_service.TOperationHandle{
+					OperationId: &cli_service.THandleIdentifier{
+						GUID:   []byte{1, 2, 3, 4, 2, 23, 4, 2, 3, 2, 3, 4, 4, 223, 34, 54},
+						Secret: []byte("b"),
+					},
+				},
+			}, nil
+		}
+		getOperationStatus := func(ctx context.Context, req *cli_service.TGetOperationStatusReq) (r *cli_service.TGetOperationStatusResp, err error) {
+			return &cli_service.TGetOperationStatusResp{
+				OperationState: cli_service.TOperationStatePtr(cli_service.TOperationState_FINISHED_STATE),
+			}, nil
+		}
+		getResultSetMetadata := func(ctx context.Context, req *cli_service.TGetResultSetMetadataReq) (_r *cli_service.TGetResultSetMetadataResp, _err error) {
+			var b = false
+			return &cli_service.TGetResultSetMetadataResp{IsStagingOperation: &b}, nil
+		}
+		testClient := &client.TestClient{
+			FnExecuteStatement:   executeStatement,
+			FnGetOperationStatus: getOperationStatus,
+			FnCloseOperation: func(ctx context.Context, req *cli_service.TCloseOperationReq) (_r *cli_service.TCloseOperationResp, _err error) {
+				return &cli_service.TCloseOperationResp{}, nil
+			},
+			FnGetResultSetMetadata: getResultSetMetadata,
+		}
+		testConn := &conn{
+			cfg:     config.WithDefaults(),
+			backend: thriftbackend.NewForTest(testClient, getTestSession(), config.WithDefaults()),
+		}
+		res, err := testConn.ExecContext(context.Background(), "create view v as select 1", []driver.NamedValue{})
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		rowsAffected, _ := res.RowsAffected()
+		assert.Equal(t, int64(-1), rowsAffected)
+	})
+
 	t.Run("ExecContext uses new context to close operation", func(t *testing.T) {
 		var executeStatementCount, getOperationStatusCount, closeOperationCount, cancelOperationCount int
 		var cancel context.CancelFunc

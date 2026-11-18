@@ -67,10 +67,11 @@ type Operation interface {
 	// returned no handle).
 	StatementID() string
 
-	// AffectedRows is the modified-row count for ExecContext results. Unlike the
-	// other accessors it is defined only on the success path — the caller reads it
-	// only after Execute returned a nil error — so an implementation need not make
-	// it safe to call on a failed/handle-less operation.
+	// AffectedRows is the modified-row count for ExecContext results, or -1 when the
+	// server reported none (DDL, views and other statements that modify no rows).
+	// Unlike the other accessors it is defined only on the success path — the caller
+	// reads it only after Execute returned a nil error — so an implementation need not
+	// make it safe to call on a failed/handle-less operation.
 	AffectedRows() int64
 
 	// Results builds the driver.Rows for the operation's result set. The callbacks

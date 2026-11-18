@@ -145,11 +145,11 @@ func TestOperationStatementID(t *testing.T) {
 }
 
 // TestOperationAffectedRows pins the accessor contract on the success path:
-// the value is read from opStatusResp.NumModifiedRows via the Thrift getter,
-// which returns 0 when the field is unset. AffectedRows is defined only on
-// the success path (per backend.Operation), where runQuery has guaranteed a
-// non-nil opStatusResp, so a nil-opStatusResp input is out of contract and
-// not tested.
+// the value is read from opStatusResp.NumModifiedRows, and is -1 when the
+// server left the field unset, so "no count" is distinguishable from a statement
+// that really modified 0 rows. AffectedRows is defined only on the success path
+// (per backend.Operation), where runQuery has guaranteed a non-nil opStatusResp;
+// a nil opStatusResp is tolerated and reports -1.
 func TestOperationAffectedRows(t *testing.T) {
 	be := NewForTest(&client.TestClient{}, getTestSession(), config.WithDefaults())
 
@@ -162,12 +162,29 @@ func TestOperationAffectedRows(t *testing.T) {
 		assert.Equal(t, int64(42), op.AffectedRows())
 	})
 
-	t.Run("returns 0 when NumModifiedRows is unset", func(t *testing.T) {
+	t.Run("returns 0 when the server reports zero modified rows", func(t *testing.T) {
+		rows := int64(0)
+		op := be.OperationForTest(
+			&cli_service.TExecuteStatementResp{OperationHandle: opHandle()},
+			&cli_service.TGetOperationStatusResp{NumModifiedRows: &rows},
+		)
+		assert.Equal(t, int64(0), op.AffectedRows())
+	})
+
+	t.Run("returns -1 when NumModifiedRows is unset", func(t *testing.T) {
 		op := be.OperationForTest(
 			&cli_service.TExecuteStatementResp{OperationHandle: opHandle()},
 			&cli_service.TGetOperationStatusResp{},
 		)
-		assert.Equal(t, int64(0), op.AffectedRows())
+		assert.Equal(t, int64(-1), op.AffectedRows())
+	})
+
+	t.Run("returns -1 when there is no status response", func(t *testing.T) {
+		op := be.OperationForTest(
+			&cli_service.TExecuteStatementResp{OperationHandle: opHandle()},
+			nil,
+		)
+		assert.Equal(t, int64(-1), op.AffectedRows())
 	})
 }
 
