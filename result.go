@@ -15,7 +15,8 @@ func (res *result) LastInsertId() (int64, error) {
 	return res.InsertId, nil
 }
 
-// RowsAffected returns the number of rows affected by the query.
+// RowsAffected returns the number of rows affected by the query, or -1 when the
+// server did not report a count (DDL, views and other statements that modify no rows).
 func (res *result) RowsAffected() (int64, error) {
 	return res.AffectedRows, nil
 }

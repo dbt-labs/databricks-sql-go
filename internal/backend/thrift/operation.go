@@ -55,8 +55,13 @@ func (o *thriftOperation) StatementID() string {
 }
 
 // AffectedRows is the modified-row count for ExecContext, from the terminal
-// status response.
+// status response, or -1 when the server reported none (DDL, views and other
+// statements that modify no rows). The Thrift getter alone would report 0 there,
+// which a caller cannot tell from a statement that really modified no rows.
 func (o *thriftOperation) AffectedRows() int64 {
+	if o.opStatusResp == nil || !o.opStatusResp.IsSetNumModifiedRows() {
+		return -1
+	}
 	return o.opStatusResp.GetNumModifiedRows()
 }
 
